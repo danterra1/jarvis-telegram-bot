@@ -1,0 +1,18 @@
+{
+  "name": "jarvis-telegram-bot",
+  "version": "1.0.0",
+  "description": "Jarvis personal AI assistant on Telegram, powered by Claude",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.66.0",
+    "@anthropic-ai/sdk": "^0.32.1",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
