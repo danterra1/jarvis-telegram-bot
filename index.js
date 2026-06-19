@@ -32,6 +32,9 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 
 // ---------- Simple file-based persistence ----------
 // Each Telegram user gets their own memory file + conversation history.
+// This file is the durable "long-term memory" store for that user — it is
+// the source of truth Claude can always fall back on, independent of
+// whatever happens to be loaded into its context window on a given turn.
 const DATA_DIR = path.join(process.cwd(), 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
 
@@ -39,20 +42,187 @@ function userFile(chatId) {
   return path.join(DATA_DIR, `user_${chatId}.json`);
 }
 
+// Bump this if the on-disk shape ever changes incompatibly.
+const DATA_VERSION = 2;
+
+function emptyUserData() {
+  return { version: DATA_VERSION, memories: [], history: [], reminders: [] };
+}
+
 function loadUserData(chatId) {
   const file = userFile(chatId);
   if (fs.existsSync(file)) {
     try {
-      return JSON.parse(fs.readFileSync(file, 'utf8'));
+      const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+      // Backfill defaults for older files / partial writes so the rest of
+      // the code never has to null-check these.
+      if (!Array.isArray(data.memories)) data.memories = [];
+      if (!Array.isArray(data.history)) data.history = [];
+      if (!Array.isArray(data.reminders)) data.reminders = [];
+      data.version = DATA_VERSION;
+      return data;
     } catch (e) {
-      console.error('Failed to parse user data, starting fresh:', e);
+      // Corrupt file — don't silently wipe the user's memory. Keep the
+      // broken file around for inspection/recovery and start a fresh
+      // in-memory object for this turn only; it will be saved fresh on
+      // the next successful write, but we log loudly so this is visible.
+      console.error(`Failed to parse user data for ${chatId}, file may be corrupt:`, e);
+      try {
+        fs.copyFileSync(file, file + '.corrupt-' + Date.now());
+      } catch (copyErr) {
+        console.error('Could not back up corrupt user file:', copyErr);
+      }
+      return emptyUserData();
     }
   }
-  return { memories: [], history: [], reminders: [] };
+  return emptyUserData();
 }
 
+// Atomic-ish write: write to a temp file then rename, so a crash mid-write
+// never leaves a half-written / corrupt JSON file on disk.
 function saveUserData(chatId, data) {
-  fs.writeFileSync(userFile(chatId), JSON.stringify(data, null, 2));
+  const file = userFile(chatId);
+  const tmp = file + '.tmp';
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    console.error(`Failed to save user data for ${chatId}:`, err);
+  }
+}
+
+// ---------- Memory helpers ----------
+// Every memory has: id, text, category, date (created), updatedAt.
+// IDs let forget/update target an exact memory instead of fuzzy substring
+// matching against text, which is fragile and can hit the wrong entry.
+function makeMemoryId() {
+  return `m_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function normalize(s) {
+  return (s || '').toLowerCase().trim();
+}
+
+// Very lightweight similarity check used to detect "this is probably the
+// same fact as one we already have" so remember_fact updates in place
+// instead of creating duplicates. Token-overlap based, no extra deps.
+function tokenOverlapScore(a, b) {
+  const ta = new Set(normalize(a).split(/\W+/).filter((w) => w.length > 2));
+  const tb = new Set(normalize(b).split(/\W+/).filter((w) => w.length > 2));
+  if (!ta.size || !tb.size) return 0;
+  let shared = 0;
+  for (const w of ta) if (tb.has(w)) shared++;
+  return shared / Math.max(ta.size, tb.size);
+}
+
+function findClosestMemory(userData, text, category) {
+  let best = null;
+  let bestScore = 0;
+  for (const m of userData.memories) {
+    if (category && m.category !== category) continue;
+    const score = tokenOverlapScore(m.text, text);
+    if (score > bestScore) {
+      bestScore = score;
+      best = m;
+    }
+  }
+  return bestScore >= 0.5 ? best : null;
+}
+
+function addMemory(userData, text, category) {
+  const existing = findClosestMemory(userData, text, category);
+  const today = new Date().toISOString().slice(0, 10);
+  if (existing) {
+    existing.text = text;
+    existing.updatedAt = today;
+    return { ok: true, updated: text, id: existing.id, note: 'Updated an existing similar memory instead of duplicating it.' };
+  }
+  const entry = { id: makeMemoryId(), text, category: category || 'other', date: today, updatedAt: today };
+  userData.memories.push(entry);
+  return { ok: true, saved: text, id: entry.id };
+}
+
+function removeMemory(userData, text) {
+  if (!userData.memories.length) return { error: 'No memories stored for this user.' };
+
+  // Prefer an exact id match if the caller happens to pass one.
+  let idx = userData.memories.findIndex((m) => m.id === text);
+
+  // Then try substring match either direction (legacy behavior).
+  if (idx === -1) {
+    const lower = normalize(text);
+    idx = userData.memories.findIndex(
+      (m) => normalize(m.text).includes(lower) || lower.includes(normalize(m.text))
+    );
+  }
+
+  // Fall back to token-overlap similarity so close paraphrases still match.
+  if (idx === -1) {
+    const best = findClosestMemory(userData, text, null);
+    if (best) idx = userData.memories.findIndex((m) => m.id === best.id);
+  }
+
+  if (idx === -1) {
+    return { error: 'Could not find a matching memory to forget.' };
+  }
+  const removed = userData.memories.splice(idx, 1)[0];
+  return { ok: true, removed: removed.text };
+}
+
+// Active recall: lets Claude explicitly search the durable memory store on
+// disk by keyword/category instead of relying solely on whatever subset got
+// pre-loaded into the system prompt this turn. This is the "if I forget
+// something, go check storage" path.
+function recallMemory(userData, query, category) {
+  const q = normalize(query);
+  const tokens = q.split(/\W+/).filter((w) => w.length > 1);
+
+  const scored = userData.memories
+    .filter((m) => !category || m.category === category)
+    .map((m) => {
+      const text = normalize(m.text);
+      let score = 0;
+      if (q && text.includes(q)) score += 2; // direct substring is a strong signal
+      for (const t of tokens) if (text.includes(t)) score += 0.5;
+      return { m, score };
+    })
+    .filter((s) => s.score > 0 || !q) // empty query = return everything (e.g. for a category browse)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 15)
+    .map((s) => s.m);
+
+  if (!scored.length) {
+    return {
+      ok: true,
+      found: false,
+      results: [],
+      note: query
+        ? `No stored memory matched "${query}". This does not mean it was never saved — try a different keyword, or tell the user you don't have that on record.`
+        : 'No memories stored for this user yet.',
+    };
+  }
+
+  return {
+    ok: true,
+    found: true,
+    results: scored.map((m) => ({ id: m.id, text: m.text, category: m.category, date: m.date, updatedAt: m.updatedAt })),
+  };
+}
+
+function setReminder(userData, text, whenIso, recurrence, isGiftOccasion) {
+  const when = new Date(whenIso);
+  if (isNaN(when.getTime())) {
+    return { error: 'Invalid date/time format for reminder.' };
+  }
+  if (!userData.reminders) userData.reminders = [];
+  userData.reminders.push({
+    text,
+    when: when.toISOString(),
+    recurrence: recurrence || 'none',
+    isGiftOccasion: !!isGiftOccasion,
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+  });
+  return { ok: true, scheduled: text, when: when.toISOString(), recurrence: recurrence || 'none' };
 }
 
 // ---------- Memory tools Claude can call ----------
@@ -60,28 +230,45 @@ const tools = [
   {
     name: 'remember_fact',
     description:
-      "Save a fact about the user to long-term memory so you can recall it in future conversations — birthdays, work deadlines, plans, preferences, names of people in their life, anything worth remembering long-term. Use this proactively whenever the user mentions something memory-worthy, without waiting to be asked.",
+      "Save a fact about the user to long-term memory so you can recall it in future conversations — birthdays, work deadlines, plans, preferences, names of people in their life, anything worth remembering long-term. Use this proactively whenever the user mentions something memory-worthy, without waiting to be asked. If a very similar memory already exists, this will update it in place instead of creating a duplicate, so it's safe to call even when correcting or refining something you already knew.",
     input_schema: {
       type: 'object',
       properties: {
-        text: { type: 'string', description: "The fact to remember, written plainly." },
+        text: { type: 'string', description: 'The fact to remember, written plainly.' },
         category: {
           type: 'string',
           enum: ['date', 'work', 'party', 'person', 'preference', 'location', 'other'],
-          description: 'One of: date, work, party, person, preference, other',
+          description: 'One of: date, work, party, person, preference, location, other',
         },
       },
       required: ['text', 'category'],
     },
   },
   {
-    name: 'forget_fact',
+    name: 'recall_memory',
     description:
-      'Remove a previously remembered fact, e.g. when the user says it is no longer true or relevant.',
+      "Actively search the user's full long-term memory store on disk for anything matching a keyword or topic. Use this whenever you're not sure whether you already know something about the user, when a memory you'd expect to have isn't showing up in what's already loaded into this conversation, or before saying 'I don't know that about you' — check storage first. You can pass an empty query with a category to browse everything in that category (e.g. all 'person' memories). This searches the same durable store remember_fact writes to, so it will find things even if they aren't currently visible in your context.",
     input_schema: {
       type: 'object',
       properties: {
-        text: { type: 'string', description: 'The text (or close match) of the memory to forget' },
+        query: { type: 'string', description: 'Keyword or phrase to search for. Leave empty to browse by category instead.' },
+        category: {
+          type: 'string',
+          enum: ['date', 'work', 'party', 'person', 'preference', 'location', 'other'],
+          description: 'Optional: restrict the search to one category.',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'forget_fact',
+    description:
+      'Remove a previously remembered fact, e.g. when the user says it is no longer true or relevant. Pass the memory id if you have it from a recall_memory or remember_fact result for an exact match, otherwise pass the text and it will be matched fuzzily.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'The memory id (preferred if known) or the text (close match) of the memory to forget' },
       },
       required: ['text'],
     },
@@ -151,38 +338,6 @@ const tools = [
   },
 ];
 
-function addMemory(userData, text, category) {
-  const entry = { text, category: category || 'other', date: new Date().toISOString().slice(0, 10) };
-  userData.memories.push(entry);
-  return { ok: true, saved: text };
-}
-
-function removeMemory(userData, text) {
-  const lower = text.trim().toLowerCase();
-  const idx = userData.memories.findIndex(
-    (m) => m.text.toLowerCase().includes(lower) || lower.includes(m.text.toLowerCase())
-  );
-  if (idx === -1) return { error: 'Could not find a matching memory to forget.' };
-  const removed = userData.memories.splice(idx, 1)[0];
-  return { ok: true, removed: removed.text };
-}
-
-function setReminder(userData, text, whenIso, recurrence, isGiftOccasion) {
-  const when = new Date(whenIso);
-  if (isNaN(when.getTime())) {
-    return { error: 'Invalid date/time format for reminder.' };
-  }
-  if (!userData.reminders) userData.reminders = [];
-  userData.reminders.push({
-    text,
-    when: when.toISOString(),
-    recurrence: recurrence || 'none',
-    isGiftOccasion: !!isGiftOccasion,
-    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-  });
-  return { ok: true, scheduled: text, when: when.toISOString(), recurrence: recurrence || 'none' };
-}
-
 // ---------- URL validation helper ----------
 // Only accept well-formed http(s) URLs. Anything else (empty, malformed,
 // relative, javascript:, etc.) is dropped so we never hand Claude — or the
@@ -231,7 +386,7 @@ async function webSearch(query) {
   }
 }
 
-// ---------- Extract URls from a reply (for voice+text dual send) ----------
+// ---------- Extract URLs from a reply (for voice+text dual send) ----------
 function extractUrls(text) {
   if (!text) return [];
   const matches = text.match(/https?:\/\/[^\s)\]]+/g) || [];
@@ -259,7 +414,9 @@ function loadActiveCalls() {
 }
 
 function saveActiveCalls(calls) {
-  fs.writeFileSync(CALLS_FILE, JSON.stringify(calls, null, 2));
+  const tmp = CALLS_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(calls, null, 2));
+  fs.renameSync(tmp, CALLS_FILE);
 }
 
 function buildBookingSystemPrompt({ business_name, party_size, date_time_description, reservation_name, special_requests }) {
@@ -327,7 +484,6 @@ async function makeBookingCall(chatId, args) {
   }
 }
 
-
 async function sendLocationRequest(chatId, reason, alsoSpeak) {
   const promptText = reason
     ? `I need your location to ${reason}. Tap the button below to share it:`
@@ -366,17 +522,37 @@ async function reverseGeocode(lat, lon) {
 }
 
 // ---------- System prompt ----------
+// Only a bounded, recent slice of memories is inlined directly into the
+// prompt every turn (cheap "working memory"). Everything else still lives
+// in the user's data file and is reachable via recall_memory — so the
+// store Claude can fall back on is never smaller than what's on disk, even
+// once the person has hundreds of memories.
+const INLINE_MEMORY_LIMIT = 25;
+
 function buildSystemPrompt(userData) {
   const nowIso = new Date().toISOString();
-  const base = `You are Jarvis, a sharp, witty personal AI assistant talking to your owner over Telegram, like texting a close friend who's good with tech. Not formal, not robotic, no "as an AI" disclaimers. Keep responses conversational and reasonably short unless they ask for real detail. The current UTC date/time is ${nowIso} — use this as "now" when the user gives a relative time (e.g. "in 20 minutes", "tomorrow at 9am"). You have long-term memory: use remember_fact whenever the user mentions something worth keeping track of (dates, work deadlines, plans, people, preferences) — do this proactively, don't wait to be asked. Use forget_fact when something they told you is no longer true. Naturally bring up relevant memories when they fit the conversation. You also have web_search — use it whenever the user asks for recommendations, current events, or anything you're not confidently sure of. When you get search results back, describe what you found in your own words, but DO include the actual name, address/link, and key details for anything the user would want to visit, click, or act on (restaurants, businesses, articles, products) — don't strip out useful URLs or names just to paraphrase, the user needs that information to actually use it. Each search result's "url" field will be null if no reliable link was found for that result — if a result has a null url, mention the name/snippet but do NOT invent, guess, or fabricate a URL for it; just skip the link for that one item. Never present a link you are not certain came directly from the search results. If the user asks for something location-dependent (nearby restaurants, local weather, directions) and you don't already have a saved location for them in memory, use request_location to ask them to share it — then wait for them to tap the button before searching. Use set_reminder whenever the user asks to be reminded or pinged about something at a future time — convert their relative time into an exact ISO datetime using the current time above, and account for their saved location's timezone if you can infer it. Be a genuinely proactive personal assistant: when a request is ambiguous or underspecified, ask a short clarifying question instead of guessing — e.g. if asked to "remind me about birthdays" without specifics, ask whose birthday, what date, and whether it repeats every year. For birthdays, anniversaries, or other yearly occasions, set recurrence to "yearly" and set is_gift_occasion to true so you can proactively suggest gift ideas when the reminder fires. You also have make_booking_call — use it when the user asks you to call and book a restaurant reservation on their behalf. Find the business's phone number via web_search if you don't already have it; never invent a phone number, ask the user for it if search doesn't find a reliable one. Before calling this tool, tell the user in your reply exactly what you're about to do (who you're calling, party size, and time) since the call happens immediately. The result of the call is reported back separately once it finishes, not in this turn. Treat every conversation as a chance to learn more about the owner — their relationships, preferences, routines — and use that to give sharper, more personalized help over time.`;
+  const base = `You are Jarvis, a sharp, witty personal AI assistant talking to your owner over Telegram, like texting a close friend who's good with tech. Not formal, not robotic, no "as an AI" disclaimers. Keep responses conversational and reasonably short unless they ask for real detail. The current UTC date/time is ${nowIso} — use this as "now" when the user gives a relative time (e.g. "in 20 minutes", "tomorrow at 9am"). 
+
+You have a durable long-term memory store for this user, saved to disk, that persists across all conversations. Use remember_fact proactively whenever the user mentions something worth keeping track of (dates, work deadlines, plans, people, preferences, locations) — don't wait to be asked. Use forget_fact when something they told you is no longer true, and remember_fact again with corrected info if they're updating rather than removing a fact. Below you'll see a list of recent/frequent memories already loaded for convenience, but that list is NOT your full memory — it's just a quick-access subset. If you're asked about something not in that list, if you're unsure whether you already know something, or if you ever catch yourself about to say "I don't know that about you," call recall_memory first to actively search the full store before answering — don't assume something was never saved just because it isn't sitting in front of you right now. This matters: the user is relying on you to actually have persistent memory, not to fake it from a short list.
+
+You also have web_search — use it whenever the user asks for recommendations, current events, or anything you're not confidently sure of. When you get search results back, describe what you found in your own words, but DO include the actual name, address/link, and key details for anything the user would want to visit, click, or act on (restaurants, businesses, articles, products) — don't strip out useful URLs or names just to paraphrase, the user needs that information to actually use it. Each search result's "url" field will be null if no reliable link was found for that result — if a result has a null url, mention the name/snippet but do NOT invent, guess, or fabricate a URL for it; just skip the link for that one item. Never present a link you are not certain came directly from the search results. If the user asks for something location-dependent (nearby restaurants, local weather, directions) and you don't already have a saved location for them in memory, use request_location to ask them to share it — then wait for them to tap the button before searching. Use set_reminder whenever the user asks to be reminded or pinged about something at a future time — convert their relative time into an exact ISO datetime using the current time above, and account for their saved location's timezone if you can infer it. Be a genuinely proactive personal assistant: when a request is ambiguous or underspecified, ask a short clarifying question instead of guessing — e.g. if asked to "remind me about birthdays" without specifics, ask whose birthday, what date, and whether it repeats every year. For birthdays, anniversaries, or other yearly occasions, set recurrence to "yearly" and set is_gift_occasion to true so you can proactively suggest gift ideas when the reminder fires. You also have make_booking_call — use it when the user asks you to call and book a restaurant reservation on their behalf. Find the business's phone number via web_search if you don't already have it; never invent a phone number, ask the user for it if search doesn't find a reliable one. Before calling this tool, tell the user in your reply exactly what you're about to do (who you're calling, party size, and time) since the call happens immediately. The result of the call is reported back separately once it finishes, not in this turn. Treat every conversation as a chance to learn more about the owner — their relationships, preferences, routines — and use that to give sharper, more personalized help over time.`;
 
   if (!userData.memories.length) return base;
 
-  const memLines = userData.memories
-    .map((m) => `- [${m.category}] ${m.text} (saved ${m.date})`)
+  // Most-recently-updated memories first, capped, so the prompt doesn't grow
+  // without bound as a user's memory store grows over months of use.
+  const sorted = [...userData.memories].sort((a, b) => (b.updatedAt || b.date).localeCompare(a.updatedAt || a.date));
+  const shown = sorted.slice(0, INLINE_MEMORY_LIMIT);
+  const omittedCount = userData.memories.length - shown.length;
+
+  const memLines = shown
+    .map((m) => `- [${m.category}] ${m.text} (id: ${m.id}, saved ${m.date}${m.updatedAt && m.updatedAt !== m.date ? `, updated ${m.updatedAt}` : ''})`)
     .join('\n');
 
-  let result = `${base}\n\nHere is what you currently remember about this user:\n${memLines}`;
+  let result = `${base}\n\nQuick-access memory (${shown.length} of ${userData.memories.length} total memories — most recently updated first):\n${memLines}`;
+  if (omittedCount > 0) {
+    result += `\n\n...and ${omittedCount} more memories not shown here. Use recall_memory to search them if relevant.`;
+  }
 
   if (userData.reminders && userData.reminders.length) {
     const remLines = userData.reminders
@@ -400,6 +576,12 @@ async function callClaude(chatId, userText, wasVoice) {
   }
 
   const MAX_TOOL_ITERATIONS = 5;
+  // Collects every web_search result used during this turn. If any search
+  // ran, we always send a text companion with the names/links/addresses —
+  // independent of whether the reply text happens to contain a raw URL,
+  // since Claude often paraphrases ("Mario's at 123 Main St") without
+  // typing out a literal link.
+  const searchResultsThisTurn = [];
 
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
     const response = await anthropic.messages.create({
@@ -420,10 +602,17 @@ async function callClaude(chatId, userText, wasVoice) {
         let result;
         if (block.name === 'remember_fact') {
           result = addMemory(userData, block.input.text, block.input.category);
+          saveUserData(chatId, userData); // persist immediately, don't wait for end of turn
+        } else if (block.name === 'recall_memory') {
+          result = recallMemory(userData, block.input.query || '', block.input.category);
         } else if (block.name === 'forget_fact') {
           result = removeMemory(userData, block.input.text);
+          saveUserData(chatId, userData);
         } else if (block.name === 'web_search') {
           result = await webSearch(block.input.query);
+          if (result && !result.error && result.results) {
+            searchResultsThisTurn.push(...result.results);
+          }
         } else if (block.name === 'request_location') {
           await sendLocationRequest(chatId, block.input.reason, wasVoice);
           userData.pendingWasVoice = wasVoice;
@@ -431,6 +620,7 @@ async function callClaude(chatId, userText, wasVoice) {
           result = { ok: true, note: 'Location request button sent to the user. Tell them you sent it and to tap it.' };
         } else if (block.name === 'set_reminder') {
           result = setReminder(userData, block.input.text, block.input.when_iso, block.input.recurrence, block.input.is_gift_occasion);
+          saveUserData(chatId, userData);
         } else if (block.name === 'make_booking_call') {
           result = await makeBookingCall(chatId, block.input);
         } else {
@@ -452,11 +642,11 @@ async function callClaude(chatId, userText, wasVoice) {
     const reply = textBlock ? textBlock.text : "Sorry, I didn't get a usable reply back.";
     userData.history.push({ role: 'assistant', content: reply });
     saveUserData(chatId, userData);
-    return reply;
+    return { reply, searchResults: searchResultsThisTurn };
   }
 
   saveUserData(chatId, userData);
-  return "I got stuck looping on tool calls — try asking again.";
+  return { reply: "I got stuck looping on tool calls — try asking again.", searchResults: searchResultsThisTurn };
 }
 
 // ---------- Voice transcription (OpenAI Whisper) ----------
@@ -525,12 +715,13 @@ async function synthesizeSpeech(text) {
 }
 
 // ---------- Send a reply, respecting voice-in/voice-out, with a text
-// ---------- companion message whenever the reply contains real links ----------
-async function sendReply(chatId, reply, wasVoice) {
+// ---------- companion message whenever there's searched info or links to share ----------
+async function sendReply(chatId, reply, wasVoice, searchResults) {
   const urls = extractUrls(reply);
+  const namedResults = (searchResults || []).filter((r) => r && r.title);
 
   if (!wasVoice) {
-    // Text in -> text out, always. Links are already inline in the text.
+    // Text in -> text out, always. Links/details are already inline in the text.
     await bot.sendMessage(chatId, reply);
     return;
   }
@@ -545,9 +736,18 @@ async function sendReply(chatId, reply, wasVoice) {
     return;
   }
 
-  // If the spoken reply contained any real links, also send a short text
-  // message with them — voice alone is useless for anything clickable.
-  if (urls.length) {
+  // If a web search ran this turn, always send a text companion with the
+  // actual names/links — voice alone can't be tapped or read carefully,
+  // and Claude often paraphrases search results without a literal URL.
+  if (namedResults.length) {
+    const lines = namedResults
+      .slice(0, 5)
+      .map((r) => (r.url ? `• ${r.title} — ${r.url}` : `• ${r.title}`));
+    const linkText = '🔗 From that search:\n' + lines.join('\n');
+    await bot.sendMessage(chatId, linkText);
+  } else if (urls.length) {
+    // No search results tracked, but the reply text itself contains links
+    // (e.g. from memory or a prior turn) — still worth sending as text.
     const linkText = '🔗 Links from that:\n' + urls.map((u) => `• ${u}`).join('\n');
     await bot.sendMessage(chatId, linkText);
   }
@@ -578,13 +778,13 @@ bot.on('message', async (msg) => {
     // whatever it was trying to do before it asked for the location.
     const wasVoiceBeforeLocation = userData.pendingWasVoice || false;
     try {
-      const reply = await callClaude(
+      const { reply, searchResults } = await callClaude(
         chatId,
         `[The user just shared their location: ${locationText}. Continue helping with whatever you needed the location for.]`,
         wasVoiceBeforeLocation
       );
       if (reply) {
-        await sendReply(chatId, reply, wasVoiceBeforeLocation);
+        await sendReply(chatId, reply, wasVoiceBeforeLocation, searchResults);
       }
     } catch (err) {
       console.error('Error continuing after location share:', err);
@@ -629,16 +829,33 @@ bot.on('message', async (msg) => {
   }
 
   if (text === '/forget_everything') {
-    saveUserData(chatId, { memories: [], history: [], reminders: [] });
+    saveUserData(chatId, emptyUserData());
     bot.sendMessage(chatId, "Done — wiped everything I remembered about you.");
+    return;
+  }
+
+  if (text === '/memories') {
+    const userData = loadUserData(chatId);
+    if (!userData.memories.length) {
+      bot.sendMessage(chatId, "I don't have anything saved about you yet.");
+      return;
+    }
+    const byCategory = {};
+    for (const m of userData.memories) {
+      (byCategory[m.category] = byCategory[m.category] || []).push(m);
+    }
+    const lines = Object.entries(byCategory)
+      .map(([cat, items]) => `*${cat}*\n` + items.map((m) => `• ${m.text}`).join('\n'))
+      .join('\n\n');
+    bot.sendMessage(chatId, `Here's everything I have stored on you (${userData.memories.length} total):\n\n${lines}`, { parse_mode: 'Markdown' });
     return;
   }
 
   bot.sendChatAction(chatId, wasVoice ? 'record_voice' : 'typing');
 
   try {
-    const reply = await callClaude(chatId, text, wasVoice);
-    await sendReply(chatId, reply, wasVoice);
+    const { reply, searchResults } = await callClaude(chatId, text, wasVoice);
+    await sendReply(chatId, reply, wasVoice, searchResults);
   } catch (err) {
     console.error('Error handling message:', err);
     bot.sendMessage(chatId, "Hit an error on my end: " + err.message);
@@ -687,7 +904,7 @@ async function sendReminderWithSuggestions(chatId, reminder) {
 async function checkReminders() {
   let files;
   try {
-    files = fs.readdirSync(DATA_DIR).filter((f) => f.startsWith('user_') && f.endsWith('.json'));
+    files = fs.readdirSync(DATA_DIR).filter((f) => f.startsWith('user_') && f.endsWith('.json') && !f.includes('.corrupt-') && !f.endsWith('.tmp'));
   } catch (err) {
     return;
   }
@@ -801,4 +1018,3 @@ webhookServer.listen(WEBHOOK_PORT, () => {
 });
 
 console.log('Jarvis Telegram bot is running...');
-
