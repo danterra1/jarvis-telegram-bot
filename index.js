@@ -64,6 +64,7 @@ function loadUserData(chatId) {
       if (typeof data.locationTimezone === 'undefined') data.locationTimezone = 'UTC';
       if (typeof data.lastWeeklyReview === 'undefined') data.lastWeeklyReview = '';
       if (typeof data.checkinSlots === 'undefined') data.checkinSlots = {};
+      if (typeof data.savedAddresses === 'undefined') data.savedAddresses = {};
       if (!Array.isArray(data.history)) data.history = [];
       if (!Array.isArray(data.reminders)) data.reminders = [];
       data.version = DATA_VERSION;
@@ -421,6 +422,111 @@ function extractUrls(text) {
   return [...new Set(cleaned)];
 }
 
+
+// ---------- Geocoding (Nominatim, no API key needed) ----------
+async function geocodeAddress(address) {
+  try {
+    const encoded = encodeURIComponent(address);
+    const resp = await fetch(
+      'https://nominatim.openstreetmap.org/search?q=' + encoded + '&format=json&limit=1',
+      { headers: { 'User-Agent': 'JarvisBot/1.0' } }
+    );
+    if (!resp.ok) return { error: 'Geocode API error ' + resp.status };
+    const data = await resp.json();
+    if (!data.length) return { error: 'Address not found: ' + address };
+    return {
+      ok: true,
+      lat: parseFloat(data[0].lat),
+      lon: parseFloat(data[0].lon),
+      formatted: data[0].display_name,
+    };
+  } catch (err) {
+    return { error: 'Geocoding failed: ' + err.message };
+  }
+}
+
+// ---------- Save named address ----------
+async function saveAddress(userData, label, address) {
+  const geo = await geocodeAddress(address);
+  if (!geo.ok) return { error: geo.error, label, address };
+
+  userData.savedAddresses[label.toLowerCase()] = {
+    label: label.toLowerCase(),
+    address,
+    formatted: geo.formatted,
+    lat: geo.lat,
+    lon: geo.lon,
+    savedAt: new Date().toISOString(),
+  };
+
+  return {
+    ok: true,
+    label: label.toLowerCase(),
+    formatted: geo.formatted,
+    lat: geo.lat,
+    lon: geo.lon,
+    message: 'Saved "' + label + '" as ' + geo.formatted,
+  };
+}
+
+// ---------- Book ride (Uber deep-link) ----------
+async function bookRide(userData, input) {
+  const { dropoff_label, dropoff_address, pickup_label, pickup_address } = input;
+
+  // ── Resolve dropoff ──────────────────────────────────────────────────────
+  let dropoff = null;
+  if (dropoff_label && userData.savedAddresses[dropoff_label.toLowerCase()]) {
+    dropoff = userData.savedAddresses[dropoff_label.toLowerCase()];
+  } else if (dropoff_address) {
+    const geo = await geocodeAddress(dropoff_address);
+    if (!geo.ok) return { error: 'Could not find dropoff address: ' + dropoff_address };
+    dropoff = { address: dropoff_address, formatted: geo.formatted, lat: geo.lat, lon: geo.lon };
+  }
+
+  if (!dropoff) {
+    const saved = Object.keys(userData.savedAddresses);
+    return {
+      error: 'No dropoff address specified.',
+      saved_addresses: saved.length ? saved.join(', ') : 'none saved yet',
+      message: saved.length
+        ? 'Where do you want to go? Saved places: ' + saved.join(', ')
+        : 'No saved addresses yet. Tell me where you want to go and I will book it.',
+    };
+  }
+
+  // ── Resolve pickup ───────────────────────────────────────────────────────
+  let pickupParams = 'pickup=my_location'; // default: user's current GPS
+  if (pickup_label && userData.savedAddresses[pickup_label.toLowerCase()]) {
+    const pu = userData.savedAddresses[pickup_label.toLowerCase()];
+    pickupParams = 'pickup[formatted_address]=' + encodeURIComponent(pu.formatted) +
+                   '&pickup[latitude]=' + pu.lat + '&pickup[longitude]=' + pu.lon;
+  } else if (pickup_address) {
+    const geo = await geocodeAddress(pickup_address);
+    if (geo.ok) {
+      pickupParams = 'pickup[formatted_address]=' + encodeURIComponent(geo.formatted) +
+                     '&pickup[latitude]=' + geo.lat + '&pickup[longitude]=' + geo.lon;
+    }
+  }
+
+  // ── Build Uber deep-link ─────────────────────────────────────────────────
+  const uberLink = 'https://m.uber.com/ul/?' + pickupParams +
+    '&dropoff[formatted_address]=' + encodeURIComponent(dropoff.formatted) +
+    '&dropoff[latitude]=' + dropoff.lat +
+    '&dropoff[longitude]=' + dropoff.lon;
+
+  // Also build a plain Google Maps directions link as backup
+  const mapsLink = 'https://www.google.com/maps/dir/?api=1&destination=' +
+    encodeURIComponent(dropoff.formatted);
+
+  return {
+    ok: true,
+    uber_link: uberLink,
+    maps_link: mapsLink,
+    dropoff: dropoff.formatted,
+    message: 'Uber link ready for ' + dropoff.formatted + '. User taps to open Uber app and confirm once. Note: full ride confirmation requires Uber for Business — the user sees the trip request in the app.',
+  };
+}
+
 // ---------- Online restaurant booking (OpenTable / Resy deep-link) ----------
 async function bookRestaurantOnline(input) {
   const { business_name, location, date_time_iso, party_size, reservation_name, opentable_url, resy_url } = input;
@@ -674,6 +780,7 @@ You are always building a richer picture of the user's life. The goal is to know
 
 HOW TO LEARN PASSIVELY (no question needed):
 - Listen and infer. If they say "my sister's coming to visit," save [relationship] sister exists. If they say "I've got a call at 9," save [habit] usually starts work by 9. If they mention "my gym" or "my accountant," save it.
+- ADDRESSES: whenever the user mentions where they live, where they work, where a family member lives, their gym, their doctor, their favorite restaurant — use save_address immediately. Don't ask, just save it. "I'm heading home to 5 Rustaveli Ave" → save_address home. "My sister lives in Batumi" → save_address sister + web_search to get a city-level coordinate. These addresses power Uber bookings.
 - Every message contains data. Extract and save without commenting on it.
 - Read emotion and context. If they say "ugh, Monday" you learn something about their week structure. Save it.
 - When they update something, notice: "I switched gyms" → forget old, save new.
@@ -703,6 +810,8 @@ The ideal outcome: after 2-3 weeks of natural conversation, you know their job, 
 TOOLS:
 - web_search: use for recommendations, current events, anything you can't confidently answer from memory. Always include real names, addresses, links from results — never invent URLs.
 - request_location: use when you need their location and don't have it saved. They only need to share once — you'll remember forever.
+- save_address: save any named address to permanent address book — home, work, gym, family members' places, etc. Use whenever the user mentions where someone or somewhere is. Geocodes and stores coordinates automatically.
+- book_ride: order an Uber using saved addresses. Use when user wants a ride anywhere. Resolves saved labels (e.g. "take me home" → looks up saved "home" address) and generates a pre-filled Uber deep-link. User taps once in the Uber app to confirm. Always check savedAddresses first before asking for an address.
 - set_reminder: convert any relative time to exact ISO datetime using their saved timezone. For yearly events (birthdays, anniversaries) set recurrence and is_gift_occasion.
 - book_restaurant_online: ALWAYS try this first for restaurant bookings. Use web_search to find the restaurant on OpenTable or Resy, pass the URL here, get back a one-tap booking link the user can confirm immediately. No call needed.
 - make_booking_call: FALLBACK ONLY — use only when the restaurant is not found on OpenTable or Resy. Find the phone number via web_search first. Tell the user what you're about to do before calling.
@@ -801,6 +910,11 @@ async function callClaude(chatId, userText, wasVoice, username) {
           result = setReminder(userData, block.input.text, block.input.when_iso, block.input.recurrence, block.input.is_gift_occasion);
           totalEventCounts.reminders = (totalEventCounts.reminders || 0) + 1;
           saveUserData(chatId, userData);
+        } else if (block.name === 'save_address') {
+          result = await saveAddress(userData, block.input.label, block.input.address);
+          saveUserData(chatId, userData);
+        } else if (block.name === 'book_ride') {
+          result = await bookRide(userData, block.input);
         } else if (block.name === 'book_restaurant_online') {
           result = await bookRestaurantOnline(block.input);
           totalEventCounts.calls = (totalEventCounts.calls || 0) + 1;
