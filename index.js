@@ -337,7 +337,7 @@ const tools = [
     input_schema: {
       type: 'object',
       properties: {
-        items: { type: 'array', items: { type: 'string' }, description: 'List of grocery items the user wants, e.g. ["milk", "bread", "eggs"].' },
+        items: { type: 'array', items: { type: 'string' }, description: 'List of grocery items, e.g. milk, bread, eggs.' },
         city: { type: 'string', description: "User's city for finding nearby stores, e.g. Tbilisi, Warsaw." },
         store_preference: { type: 'string', description: 'Specific store name if user mentioned one, optional.' },
       },
@@ -369,7 +369,7 @@ const tools = [
         query: { type: 'string', description: 'Product search query, e.g. "wireless headphones", "summer dress", "phone case for iPhone 15".' },
         category: { type: 'string', enum: ['electronics', 'fashion', 'home', 'beauty', 'sports', 'toys', 'general'], description: 'Product category to pick the best platforms. Use general if unsure.' },
         budget: { type: 'string', description: 'Budget hint if user mentioned one, e.g. "under $30", "cheap", "premium".' },
-        platforms: { type: 'array', items: { type: 'string', enum: ['amazon', 'aliexpress', 'shein', 'ebay'] }, description: 'Specific platforms to search if user asked for them. Leave empty to auto-select based on category.' },
+        platforms: { type: 'array', items: { type: 'string' }, description: 'Specific platforms: amazon, aliexpress, shein, ebay. Leave empty to auto-select based on category.' },
       },
       required: ['query'],
     },
@@ -388,32 +388,6 @@ const tools = [
         cabin: { type: 'string', enum: ['economy', 'premium_economy', 'business', 'first'], description: 'Cabin class. Default economy.' },
       },
       required: ['origin', 'destination', 'departure_date'],
-    },
-  },
-  {
-    name: 'save_address',
-    description: 'Save a named address to the user\'s permanent address book (home, work, gym, sister\'s place, etc.). Use whenever the user mentions where someone or somewhere is — proactively, without being asked. Geocodes the address to lat/lon so rides can be booked later without asking again.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        label: { type: 'string', description: 'Short lowercase name: home, work, gym, sister, mom, airport, etc.' },
-        address: { type: 'string', description: 'Full street address including city and country if known.' },
-      },
-      required: ['label', 'address'],
-    },
-  },
-  {
-    name: 'book_ride',
-    description: 'Order an Uber ride for the user. ALWAYS check saved addresses first — user says "take me home" means look up label=home in savedAddresses. Returns a one-tap Uber deep-link and a Google Maps backup link. User opens the Uber link and taps Confirm once in the Uber app. If no dropoff is known, list their saved addresses and ask.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        dropoff_label: { type: 'string', description: 'Label of a saved address, e.g. home, work, sister. Use if user named a saved place.' },
-        dropoff_address: { type: 'string', description: 'Full address string if no saved label. Geocoded automatically.' },
-        pickup_label: { type: 'string', description: 'Label of saved pickup address. Omit to use current GPS location.' },
-        pickup_address: { type: 'string', description: 'Full pickup address if not using current location.' },
-      },
-      required: [],
     },
   },
   {
