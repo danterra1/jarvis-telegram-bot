@@ -582,6 +582,7 @@ async function callClaude(chatId, userText, wasVoice) {
   // since Claude often paraphrases ("Mario's at 123 Main St") without
   // typing out a literal link.
   const searchResultsThisTurn = [];
+  let totalAnthropicTokens = 0;
 
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
     const response = await anthropic.messages.create({
@@ -592,6 +593,7 @@ async function callClaude(chatId, userText, wasVoice) {
       tools,
     });
 
+    totalAnthropicTokens += (response.usage?.input_tokens || 0) + (response.usage?.output_tokens || 0);
     const toolUseBlocks = response.content.filter((b) => b.type === 'tool_use');
 
     if (toolUseBlocks.length > 0) {
@@ -642,11 +644,11 @@ async function callClaude(chatId, userText, wasVoice) {
     const reply = textBlock ? textBlock.text : "Sorry, I didn't get a usable reply back.";
     userData.history.push({ role: 'assistant', content: reply });
     saveUserData(chatId, userData);
-    return { reply, searchResults: searchResultsThisTurn };
+    return { reply, searchResults: searchResultsThisTurn, anthropicTokens: totalAnthropicTokens };
   }
 
   saveUserData(chatId, userData);
-  return { reply: "I got stuck looping on tool calls — try asking again.", searchResults: searchResultsThisTurn };
+  return { reply: "I got stuck looping on tool calls — try asking again.", searchResults: searchResultsThisTurn, anthropicTokens: totalAnthropicTokens };
 }
 
 // ---------- Voice transcription (OpenAI Whisper) ----------
@@ -855,7 +857,8 @@ bot.on('message', async (msg) => {
   bot.sendChatAction(chatId, wasVoice ? 'record_voice' : 'typing');
 
   try {
-    const { reply, searchResults } = await callClaude(chatId, text, wasVoice);
+    const { reply, searchResults, anthropicTokens: at1 } = await callClaude(chatId, text, wasVoice);
+    reportUsage(msg.from?.username, at1 || 0, 0);
     await sendReply(chatId, reply, wasVoice, searchResults);
   } catch (err) {
     console.error('Error handling message:', err);
@@ -1031,6 +1034,18 @@ webhookServer.listen(WEBHOOK_PORT, () => {
 
 
 // ---------- One-time migration: register existing users in admin panel ----------
+
+async function reportUsage(username, anthropicTokens, openaiTokens) {
+  if (!username || (!anthropicTokens && !openaiTokens)) return;
+  try {
+    await fetch('https://c79b1d1c-b690-42a4-89c1-7aa003a55a66-00-3gtw2r50e421s.pike.replit.dev/api/bot/usage', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ telegram_username: username, anthropic_tokens: anthropicTokens, openai_tokens: openaiTokens })
+    });
+  } catch (_) {}
+}
+
 async function migrateExistingUsers() {
   let files;
   try {
