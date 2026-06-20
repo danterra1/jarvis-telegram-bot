@@ -60,6 +60,8 @@ function loadUserData(chatId) {
       if (typeof data.username === 'undefined') data.username = '';
       if (typeof data.firstName === 'undefined') data.firstName = '';
       if (typeof data.warnedReminders === 'undefined') data.warnedReminders = {};
+      if (typeof data.locationUtcOffset === 'undefined') data.locationUtcOffset = 0;
+      if (typeof data.locationTimezone === 'undefined') data.locationTimezone = 'UTC';
       if (!Array.isArray(data.history)) data.history = [];
       if (!Array.isArray(data.reminders)) data.reminders = [];
       data.version = DATA_VERSION;
@@ -509,19 +511,34 @@ async function sendLocationRequest(chatId, reason, alsoSpeak) {
 }
 
 async function reverseGeocode(lat, lon) {
+  let place = null;
+  let utcOffsetHrs = 0;
+  let timezone = 'UTC';
   try {
-    const resp = await fetch(
+    // Get city name from Nominatim
+    const geoResp = await fetch(
       `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=10`,
       { headers: { 'User-Agent': 'jarvis-telegram-bot/1.0' } }
     );
-    if (!resp.ok) return null;
-    const data = await resp.json();
-    const addr = data.address || {};
-    const place = addr.city || addr.town || addr.village || addr.county || data.display_name;
-    return place || null;
-  } catch (err) {
-    return null;
-  }
+    if (geoResp.ok) {
+      const geoData = await geoResp.json();
+      const addr = geoData.address || {};
+      place = addr.city || addr.town || addr.village || addr.county || geoData.display_name || null;
+    }
+  } catch (_) {}
+  try {
+    // Get timezone from Open-Meteo (free, no key)
+    const tzResp = await fetch(
+      `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&timezone=auto&forecast_days=0`
+    );
+    if (tzResp.ok) {
+      const tzData = await tzResp.json();
+      timezone = tzData.timezone || 'UTC';
+      // utc_offset_seconds is in the response
+      utcOffsetHrs = (tzData.utc_offset_seconds || 0) / 3600;
+    }
+  } catch (_) {}
+  return { place, utcOffsetHrs, timezone };
 }
 
 // ---------- System prompt ----------
@@ -535,11 +552,14 @@ const INLINE_MEMORY_LIMIT = 25;
 
 function buildSystemPrompt(userData) {
   const nowIso = new Date().toISOString();
+  const locationLine = userData.locationPlace
+    ? `\n\nThe user is based in ${userData.locationPlace} (${userData.locationTimezone || 'UTC'}). Always use this for timezone, weather, and location-based queries unless they share a different location.`
+    : '';
   const base = `You are Jarvis, a sharp, witty personal AI assistant talking to your owner over Telegram, like texting a close friend who's good with tech. Not formal, not robotic, no "as an AI" disclaimers. Keep responses conversational and reasonably short unless they ask for real detail. The current UTC date/time is ${nowIso} — use this as "now" when the user gives a relative time (e.g. "in 20 minutes", "tomorrow at 9am"). 
 
 You have a durable long-term memory store for this user, saved to disk, that persists across all conversations. Use remember_fact proactively whenever the user mentions something worth keeping track of (dates, work deadlines, plans, people, preferences, locations) — don't wait to be asked. Use forget_fact when something they told you is no longer true, and remember_fact again with corrected info if they're updating rather than removing a fact. Below you'll see a list of recent/frequent memories already loaded for convenience, but that list is NOT your full memory — it's just a quick-access subset. If you're asked about something not in that list, if you're unsure whether you already know something, or if you ever catch yourself about to say "I don't know that about you," call recall_memory first to actively search the full store before answering — don't assume something was never saved just because it isn't sitting in front of you right now. This matters: the user is relying on you to actually have persistent memory, not to fake it from a short list.
 
-You also have web_search — use it whenever the user asks for recommendations, current events, or anything you're not confidently sure of. When you get search results back, describe what you found in your own words, but DO include the actual name, address/link, and key details for anything the user would want to visit, click, or act on (restaurants, businesses, articles, products) — don't strip out useful URLs or names just to paraphrase, the user needs that information to actually use it. Each search result's "url" field will be null if no reliable link was found for that result — if a result has a null url, mention the name/snippet but do NOT invent, guess, or fabricate a URL for it; just skip the link for that one item. Never present a link you are not certain came directly from the search results. If the user asks for something location-dependent (nearby restaurants, local weather, directions) and you don't already have a saved location for them in memory, use request_location to ask them to share it — then wait for them to tap the button before searching. Use set_reminder whenever the user asks to be reminded or pinged about something at a future time — convert their relative time into an exact ISO datetime using the current time above, and account for their saved location's timezone if you can infer it. Be a genuinely proactive personal assistant: when a request is ambiguous or underspecified, ask a short clarifying question instead of guessing — e.g. if asked to "remind me about birthdays" without specifics, ask whose birthday, what date, and whether it repeats every year. For birthdays, anniversaries, or other yearly occasions, set recurrence to "yearly" and set is_gift_occasion to true so you can proactively suggest gift ideas when the reminder fires. You also have make_booking_call — use it when the user asks you to call and book a restaurant reservation on their behalf. Find the business's phone number via web_search if you don't already have it; never invent a phone number, ask the user for it if search doesn't find a reliable one. Before calling this tool, tell the user in your reply exactly what you're about to do (who you're calling, party size, and time) since the call happens immediately. The result of the call is reported back separately once it finishes, not in this turn. Treat every conversation as a chance to learn more about the owner — their relationships, preferences, routines — and use that to give sharper, more personalized help over time.`;
+You also have web_search — use it whenever the user asks for recommendations, current events, or anything you're not confidently sure of. When you get search results back, describe what you found in your own words, but DO include the actual name, address/link, and key details for anything the user would want to visit, click, or act on (restaurants, businesses, articles, products) — don't strip out useful URLs or names just to paraphrase, the user needs that information to actually use it. Each search result's "url" field will be null if no reliable link was found for that result — if a result has a null url, mention the name/snippet but do NOT invent, guess, or fabricate a URL for it; just skip the link for that one item. Never present a link you are not certain came directly from the search results. If the user asks for something location-dependent (nearby restaurants, local weather, directions) and you don't already have a saved location for them in memory, use request_location to ask them to share it — then wait for them to tap the button before searching. Use set_reminder whenever the user asks to be reminded or pinged about something at a future time — convert their relative time into an exact ISO datetime using the current time above, and account for their saved location's timezone if you can infer it. Be a genuinely proactive personal assistant: when a request is ambiguous or underspecified, ask a short clarifying question instead of guessing — e.g. if asked to "remind me about birthdays" without specifics, ask whose birthday, what date, and whether it repeats every year. For birthdays, anniversaries, or other yearly occasions, set recurrence to "yearly" and set is_gift_occasion to true so you can proactively suggest gift ideas when the reminder fires. You also have make_booking_call — use it when the user asks you to call and book a restaurant reservation on their behalf. Find the business's phone number via web_search if you don't already have it; never invent a phone number, ask the user for it if search doesn't find a reliable one. Before calling this tool, tell the user in your reply exactly what you're about to do (who you're calling, party size, and time) since the call happens immediately. The result of the call is reported back separately once it finishes, not in this turn. Treat every conversation as a chance to learn more about the owner — their relationships, preferences, routines — and use that to give sharper, more personalized help over time.${locationLine}`;
 
   if (!userData.memories.length) return base;
 
@@ -774,18 +794,33 @@ bot.on('message', async (msg) => {
   if (msg.location) {
     const { latitude, longitude } = msg.location;
     bot.sendChatAction(chatId, 'typing');
-    const place = await reverseGeocode(latitude, longitude);
+    const geo = await reverseGeocode(latitude, longitude);
+    const { place, utcOffsetHrs, timezone } = geo || { place: null, utcOffsetHrs: 0, timezone: 'UTC' };
     const userData = loadUserData(chatId);
+
+    // Store coordinates + timezone directly in userData for quick access
+    userData.locationLat = latitude;
+    userData.locationLon = longitude;
+    userData.locationPlace = place || null;
+    userData.locationTimezone = timezone;
+    userData.locationUtcOffset = utcOffsetHrs;
+
+    // Also save as a memory so Claude always knows it in the system prompt
+    const tzLabel = utcOffsetHrs >= 0 ? 'UTC+' + utcOffsetHrs : 'UTC' + utcOffsetHrs;
     const locationText = place
-      ? `User's current location is ${place} (lat ${latitude}, lon ${longitude})`
-      : `User's current location is lat ${latitude}, lon ${longitude}`;
-    // Replace any previous location memory rather than stacking duplicates
+      ? `User is based in ${place} (${timezone}, ${tzLabel}), coordinates ${latitude.toFixed(4)}, ${longitude.toFixed(4)}`
+      : `User coordinates ${latitude.toFixed(4)}, ${longitude.toFixed(4)} (${timezone}, ${tzLabel})`;
     userData.memories = userData.memories.filter((m) => m.category !== 'location');
     addMemory(userData, locationText, 'location');
     saveUserData(chatId, userData);
-    bot.sendMessage(chatId, place ? `Got it — I'll remember you're around ${place}.` : 'Got your location, thanks.', {
-      reply_markup: { remove_keyboard: true },
-    });
+
+    const tzDisplay = utcOffsetHrs === 0 ? 'UTC' : tzLabel;
+    bot.sendMessage(chatId,
+      place
+        ? `Got it — I know you're in ${place} (${tzDisplay}). I'll use this for reminders, weather, and suggestions from now on.`
+        : `Got your location (${tzDisplay}). I'll remember this for reminders and searches.`,
+      { reply_markup: { remove_keyboard: true } }
+    );
     // Feed the location into the conversation so Claude can pick back up
     // whatever it was trying to do before it asked for the location.
     const wasVoiceBeforeLocation = userData.pendingWasVoice || false;
@@ -1042,9 +1077,10 @@ async function sendMorningBriefings() {
       (userData.memories && userData.memories.length > 2);
     if (!hasContent) continue;
 
-    // Infer UTC offset from location memories (e.g. "UTC+4" saved as a memory)
-    let utcOffsetHrs = 0;
-    if (userData.memories) {
+    // Use stored timezone offset (set when user shared location)
+    // Fall back to parsing from memories for older users
+    let utcOffsetHrs = userData.locationUtcOffset || 0;
+    if (!utcOffsetHrs && userData.memories) {
       for (const m of userData.memories) {
         const match = m.text.match(/UTC([+-]\d+(?:\.\d+)?)/i) || m.text.match(/GMT([+-]\d+(?:\.\d+)?)/i);
         if (match) { utcOffsetHrs = parseFloat(match[1]); break; }
