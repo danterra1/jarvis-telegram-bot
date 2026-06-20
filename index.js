@@ -59,6 +59,7 @@ function loadUserData(chatId) {
       if (!Array.isArray(data.memories)) data.memories = [];
       if (typeof data.username === 'undefined') data.username = '';
       if (typeof data.firstName === 'undefined') data.firstName = '';
+      if (typeof data.warnedReminders === 'undefined') data.warnedReminders = {};
       if (!Array.isArray(data.history)) data.history = [];
       if (!Array.isArray(data.reminders)) data.reminders = [];
       data.version = DATA_VERSION;
@@ -955,7 +956,167 @@ async function checkReminders() {
   }
 }
 
+
+// ─── Proactive: deadline warnings ────────────────────────────────────────────
+// Runs hourly. For each user, sends a heads-up if a reminder is 3 days or
+// 1 day away — only once per threshold per reminder (tracked in warnedReminders).
+async function checkUpcomingDeadlines() {
+  let files;
+  try {
+    files = fs.readdirSync(DATA_DIR).filter(
+      (f) => f.startsWith('user_') && f.endsWith('.json') && !f.includes('.corrupt-') && !f.endsWith('.tmp')
+    );
+  } catch (_) { return; }
+
+  const now = Date.now();
+
+  for (const file of files) {
+    const chatId = file.slice('user_'.length, -'.json'.length);
+    let userData;
+    try {
+      userData = JSON.parse(fs.readFileSync(path.join(DATA_DIR, file), 'utf8'));
+    } catch (_) { continue; }
+
+    if (!userData.reminders || !userData.reminders.length) continue;
+    if (!userData.warnedReminders) userData.warnedReminders = {};
+
+    let changed = false;
+    for (const reminder of userData.reminders) {
+      const dueMs = new Date(reminder.when).getTime();
+      const diffHrs = (dueMs - now) / (1000 * 60 * 60);
+      const remKey = reminder.id || reminder.text.slice(0, 40);
+
+      for (const [label, minH, maxH, daysWord] of [
+        ['3d', 71, 73, '3 days'],
+        ['1d', 23, 25, 'tomorrow'],
+      ]) {
+        const warnKey = remKey + '_' + label;
+        if (diffHrs >= minH && diffHrs <= maxH && !userData.warnedReminders[warnKey]) {
+          userData.warnedReminders[warnKey] = true;
+          changed = true;
+          const dueDate = new Date(reminder.when).toLocaleString('en-US', {
+            weekday: 'short', month: 'short', day: 'numeric',
+            hour: '2-digit', minute: '2-digit',
+          });
+          const msg = 'Heads up — ' + daysWord + ': ' + reminder.text + ' (due ' + dueDate + ')';
+          bot.sendMessage(chatId, msg).catch(() => {});
+        }
+      }
+    }
+
+    // Clean stale warning keys for reminders that no longer exist
+    const activeKeys = new Set(userData.reminders.map((r) => (r.id || r.text.slice(0, 40))));
+    for (const key of Object.keys(userData.warnedReminders)) {
+      const base = key.replace(/_3d$|_1d$/, '');
+      if (!activeKeys.has(base)) {
+        delete userData.warnedReminders[key];
+        changed = true;
+      }
+    }
+
+    if (changed) saveUserData(chatId, userData);
+  }
+}
+
+// ─── Proactive: morning briefing ─────────────────────────────────────────────
+// Runs every 15 min. At 8:00–8:14 AM local time, sends each user a short
+// AI-generated briefing of today + the next 7 days. Only once per calendar day.
+async function sendMorningBriefings() {
+  let files;
+  try {
+    files = fs.readdirSync(DATA_DIR).filter(
+      (f) => f.startsWith('user_') && f.endsWith('.json') && !f.includes('.corrupt-') && !f.endsWith('.tmp')
+    );
+  } catch (_) { return; }
+
+  for (const file of files) {
+    const chatId = file.slice('user_'.length, -'.json'.length);
+    let userData;
+    try {
+      userData = JSON.parse(fs.readFileSync(path.join(DATA_DIR, file), 'utf8'));
+    } catch (_) { continue; }
+
+    // Only brief users who have some content to talk about
+    const hasContent =
+      (userData.reminders && userData.reminders.length) ||
+      (userData.memories && userData.memories.length > 2);
+    if (!hasContent) continue;
+
+    // Infer UTC offset from location memories (e.g. "UTC+4" saved as a memory)
+    let utcOffsetHrs = 0;
+    if (userData.memories) {
+      for (const m of userData.memories) {
+        const match = m.text.match(/UTC([+-]\d+(?:\.\d+)?)/i) || m.text.match(/GMT([+-]\d+(?:\.\d+)?)/i);
+        if (match) { utcOffsetHrs = parseFloat(match[1]); break; }
+      }
+    }
+
+    const nowUtc = new Date();
+    const localMs = nowUtc.getTime() + utcOffsetHrs * 3600000;
+    const localDate = new Date(localMs);
+    const localHour = localDate.getUTCHours();
+    const localMin = localDate.getUTCMinutes();
+
+    // Send only between 08:00 and 08:14 local
+    if (localHour !== 8 || localMin >= 15) continue;
+
+    // Only once per calendar day
+    const todayStr = localDate.toISOString().slice(0, 10);
+    if (userData.lastBriefingDate === todayStr) continue;
+
+    userData.lastBriefingDate = todayStr;
+    saveUserData(chatId, userData);
+
+    // Gather upcoming reminders (next 7 days)
+    const in7Days = localMs + 7 * 24 * 3600000;
+    const upcoming = (userData.reminders || [])
+      .filter((r) => {
+        const t = new Date(r.when).getTime();
+        return t >= localMs && t <= in7Days;
+      })
+      .sort((a, b) => new Date(a.when) - new Date(b.when))
+      .map((r) => {
+        const dt = new Date(r.when).toLocaleString('en-US', {
+          weekday: 'short', month: 'short', day: 'numeric',
+          hour: '2-digit', minute: '2-digit',
+        });
+        return '- ' + r.text + ' (' + dt + ')';
+      })
+      .join('\n');
+
+    const recentMemories = (userData.memories || [])
+      .sort((a, b) => (b.updatedAt || b.date).localeCompare(a.updatedAt || a.date))
+      .slice(0, 20)
+      .map((m) => '- [' + m.category + '] ' + m.text)
+      .join('\n');
+
+    const dayLabel = localDate.toLocaleDateString('en-US', {
+      weekday: 'long', month: 'long', day: 'numeric',
+    });
+
+    const briefingPrompt = 'Today is ' + dayLabel + '. Write a short friendly morning briefing for the user in 3-5 sentences. ' +
+      'Cover what is coming up today and this week, and flag anything time-sensitive from their memories (deadlines, tasks, plans). ' +
+      'Tone: like texting a smart friend good morning. No bullet lists, flowing text. No "as an AI" language.\n\n' +
+      'UPCOMING REMINDERS:\n' + (upcoming || 'None in the next 7 days.') + '\n\n' +
+      'USER MEMORIES:\n' + (recentMemories || 'None saved yet.');
+
+    try {
+      const resp = await anthropic.messages.create({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 250,
+        messages: [{ role: 'user', content: briefingPrompt }],
+      });
+      const text = resp.content.find((b) => b.type === 'text')?.text;
+      if (text) await bot.sendMessage(chatId, 'Good morning. ' + text);
+    } catch (err) {
+      console.error('[briefing] chatId', chatId, err.message);
+    }
+  }
+}
+
 setInterval(checkReminders, 60 * 1000);
+setInterval(checkUpcomingDeadlines, 60 * 60 * 1000); // hourly: 3-day and 1-day warnings
+setInterval(sendMorningBriefings, 15 * 60 * 1000);   // every 15 min: 8 AM local briefing
 
 // ---------- Webhook server (Vapi call outcomes) ----------
 // Vapi posts here when an outbound booking call finishes. We look up which
