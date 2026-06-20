@@ -319,7 +319,7 @@ const tools = [
   },
   {
     name: 'book_ride',
-    description: "Order a ride for the user — returns both Uber and Bolt deep-links so user picks their preferred app. ALWAYS check savedAddresses first. 'Take me home' means look up label=home. If no dropoff is known, list their saved addresses and ask.",
+    description: "Order a ride — returns Uber, Bolt, and/or Yango links based on the user's location (e.g. in Georgia only Bolt and Yango operate, not Uber). ALWAYS check savedAddresses first. 'Take me home' means look up label=home. If no dropoff is known, list their saved addresses and ask.",
     input_schema: {
       type: 'object',
       properties: {
@@ -593,8 +593,18 @@ async function bookRide(userData, input) {
     }
   }
 
-  // ── Build Uber deep-link ─────────────────────────────────────────────────
-  const uberLink = 'https://m.uber.com/ul/?' + pickupParams +
+  // ── Detect market from saved location ───────────────────────────────────
+  const locationCtx = (userData.locationPlace || userData.locationTimezone || '').toLowerCase();
+  // Markets where Uber does NOT operate (Yango/Bolt are primary)
+  const noUberMarkets = ['georgia','tbilisi','batumi','kutaisi','kazakhstan','almaty',
+    'nur-sultan','astana','yerevan','armenia','baku','azerbaijan','tashkent',
+    'uzbekistan','minsk','belarus','serbia','belgrade','morocco','casablanca',
+    'ghana','accra','ivory coast','abidjan','senegal','dakar','tanzania'];
+  const isNoUberMarket = noUberMarkets.some(m => locationCtx.includes(m));
+
+  // ── Build Uber deep-link (skip in no-Uber markets) ───────────────────────
+  const uberLink = isNoUberMarket ? null :
+    'https://m.uber.com/ul/?' + pickupParams +
     '&dropoff[formatted_address]=' + encodeURIComponent(dropoff.formatted) +
     '&dropoff[latitude]=' + dropoff.lat +
     '&dropoff[longitude]=' + dropoff.lon;
@@ -605,18 +615,30 @@ async function bookRide(userData, input) {
     '&dropoff_lng=' + dropoff.lon +
     '&dropoff_name=' + encodeURIComponent(dropoff.formatted);
 
+  // ── Build Yango link ──────────────────────────────────────────────────────
+  const yangoLink = 'https://yango.com/';
+
   // ── Google Maps backup ────────────────────────────────────────────────────
   const mapsLink = 'https://www.google.com/maps/dir/?api=1&destination=' +
     encodeURIComponent(dropoff.formatted);
 
-  return {
+  // ── Build message with available apps ────────────────────────────────────
+  const parts = [];
+  if (uberLink)  parts.push('Uber: ' + uberLink);
+  parts.push('Bolt: ' + boltLink);
+  parts.push('Yango: ' + yangoLink);
+
+  const result = {
     ok: true,
-    uber_link: uberLink,
     bolt_link: boltLink,
+    yango_link: yangoLink,
     maps_link: mapsLink,
     dropoff: dropoff.formatted,
-    message: 'Ride links ready for ' + dropoff.formatted + ': Uber — ' + uberLink + ' | Bolt — ' + boltLink,
+    market_note: isNoUberMarket ? 'Uber not available in this market — showing Bolt and Yango' : 'All apps available',
+    message: 'Ride links for ' + dropoff.formatted + ': ' + parts.join(' | '),
   };
+  if (uberLink) result.uber_link = uberLink;
+  return result;
 }
 
 // ---------- Order groceries (Wolt + Glovo deep-links) ----------
@@ -1110,7 +1132,7 @@ TOOLS:
 - save_address: save any named address to permanent address book — home, work, gym, family members' places, etc. Use whenever the user mentions where someone or somewhere is. Geocodes and stores coordinates automatically.
 - book_ride: order an Uber using saved addresses. Use when user wants a ride anywhere. Resolves saved labels (e.g. "take me home" → looks up saved "home" address) and generates a pre-filled Uber deep-link. User taps once in the Uber app to confirm. Always check savedAddresses first before asking for an address.
 - set_reminder: convert any relative time to exact ISO datetime using their saved timezone. For yearly events (birthdays, anniversaries) set recurrence and is_gift_occasion.
-- book_ride: order a ride — returns Uber AND Bolt links, user picks their app. Resolves saved address labels (home, work, sister, etc.) automatically. Use for any ride/taxi request.
+- book_ride: order a ride — returns Bolt + Yango always, plus Uber if available in the market (e.g. in Georgia/CIS Uber does not operate, so only Bolt + Yango are shown). Resolves saved address labels automatically. Use for any taxi/ride request.
 - order_groceries: generate Wolt and Glovo links for grocery/food delivery. Takes a list of items and the user's city. User picks items in the app.
 - search_hotels: find hotels/Airbnbs — generates pre-filled Booking.com and Airbnb search links with dates, guests, destination. Use for any hotel or accommodation request.
 - search_flights: search flights on Google Flights, Skyscanner, and Kayak. Use for any travel/flying request. Handles one-way and return. Always save the trip to memory.
