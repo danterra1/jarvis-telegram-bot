@@ -1163,6 +1163,7 @@ TOOLS:
 - book_restaurant_online: ALWAYS try this first for restaurant bookings. Use web_search to find the restaurant on OpenTable or Resy, pass the URL here, get back a one-tap booking link the user can confirm immediately. No call needed.
 - make_booking_call: FALLBACK ONLY — use only when the restaurant is not found on OpenTable or Resy. Find the phone number via web_search first. Tell the user what you're about to do before calling.
 - remember_fact / recall_memory / forget_fact: your memory tools — use constantly.
+- Images/photos: when the user sends a photo (receipt, screenshot, menu, document, business card, anything), you receive it with full vision. Extract all useful information and save key facts to memory immediately. Receipts → save amounts/vendors to [finance]. Business cards → save contact to [person]. Menus → answer questions about them. Documents → summarise and extract action items.
 
 ${locationLine}`;
 
@@ -1542,24 +1543,171 @@ bot.on('message', async (msg) => {
     }
   }
 
+  // ── Photo / image messages ──────────────────────────────────────────────────
+  if (msg.photo || (msg.document && msg.document.mime_type && msg.document.mime_type.startsWith('image/'))) {
+    bot.sendChatAction(chatId, 'typing');
+    try {
+      const fileId = msg.photo
+        ? msg.photo[msg.photo.length - 1].file_id   // largest size
+        : msg.document.file_id;
+      const caption = msg.caption || '';
+      const fileLink = await bot.getFileLink(fileId);
+      const imgResp = await fetch(fileLink);
+      if (!imgResp.ok) throw new Error('Could not download image from Telegram');
+      const imgBuffer = await imgResp.arrayBuffer();
+      const base64 = Buffer.from(imgBuffer).toString('base64');
+      const mimeType = msg.photo ? 'image/jpeg' : (msg.document.mime_type || 'image/jpeg');
+
+      const userData = loadUserData(chatId);
+      const systemPrompt = buildSystemPrompt(userData);
+      const nowIso = new Date().toISOString();
+
+      // Build vision message — image block + text prompt
+      const visionPrompt = caption
+        ? caption
+        : 'The user sent you an image with no caption. Analyse it in detail: describe what you see, extract any text or numbers, identify if it is a receipt/invoice/menu/document/screenshot/photo, and explain what it means for them. If it contains actionable information (amounts, dates, contacts, to-dos), save key facts to memory immediately using remember_fact.';
+
+      const imageMessage = {
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64 } },
+          { type: 'text', text: visionPrompt }
+        ]
+      };
+
+      // Build a fresh message array (do not push raw image to persistent history — too large)
+      const historyForVision = userData.history.slice(-10);   // last 10 turns for context
+      const messagesForVision = [...historyForVision, imageMessage];
+
+      let visionResult;
+      let attempts = 0;
+      const maxAttempts = 3;
+      while (attempts < maxAttempts) {
+        attempts++;
+        const vResp = await anthropic.messages.create({
+          model: MODEL,
+          max_tokens: 800,
+          system: systemPrompt,
+          messages: messagesForVision,
+          tools,
+        });
+
+        if (vResp.stop_reason === 'tool_use') {
+          // Claude wants to save something to memory — execute memory tools only
+          const toolBlocks = vResp.content.filter(b => b.type === 'tool_use');
+          const toolResults = [];
+          for (const tb of toolBlocks) {
+            let res;
+            if (tb.name === 'remember_fact')   { res = addMemory(userData, tb.input.text, tb.input.category); saveUserData(chatId, userData); }
+            else if (tb.name === 'forget_fact') { res = removeMemory(userData, tb.input.text); saveUserData(chatId, userData); }
+            else if (tb.name === 'web_search')  { res = await webSearch(tb.input.query); }
+            else                                { res = { error: 'Tool not available for image analysis' }; }
+            toolResults.push({ type: 'tool_result', tool_use_id: tb.id, content: JSON.stringify(res) });
+          }
+          messagesForVision.push({ role: 'assistant', content: vResp.content });
+          messagesForVision.push({ role: 'user', content: toolResults });
+          continue;
+        }
+
+        const textBlock = vResp.content.find(b => b.type === 'text');
+        visionResult = textBlock ? textBlock.text : 'I can see the image but could not generate a description.';
+        break;
+      }
+
+      // Save a text summary to history so Claude remembers the image was shared
+      const historyNote = '[User shared an image' + (caption ? ' with caption: ' + caption : '') + '. Analysis: ' + (visionResult || '').slice(0, 300) + ']';
+      userData.history.push({ role: 'user', content: historyNote });
+      userData.history.push({ role: 'assistant', content: visionResult || '' });
+      if (userData.history.length > MAX_HISTORY * 2) userData.history = userData.history.slice(-MAX_HISTORY * 2);
+      saveUserData(chatId, userData);
+
+      await bot.sendMessage(chatId, visionResult || 'Got the image — could not analyse it.');
+    } catch (err) {
+      console.error('Image handling error:', err);
+      bot.sendMessage(chatId, 'Hit an error reading that image: ' + err.message);
+    }
+    return;
+  }
+
   if (!text) {
-    bot.sendMessage(chatId, "I can only handle text or voice messages right now.");
+    bot.sendMessage(chatId, "Send me text, a voice message, or a photo — I'll handle all three.");
     return;
   }
 
   if (text === '/start') {
     registerWithJarvis(msg.from?.username, msg.from?.first_name);
-    bot.sendMessage(
-      chatId,
-      "Hey, I'm Jarvis. Just talk to me normally — I'll remember things you tell me and bring them up later. What's up?"
-    );
-    sendLocationRequest(chatId, 'know your timezone and location for things like reminders, nearby suggestions, and local weather', false);
+    const existingData = loadUserData(chatId);
+    const isNewUser = !existingData.memories.length && !existingData.locationPlace;
+
+    if (isNewUser) {
+      // Rich onboarding for first-time users
+      const firstName = msg.from?.first_name || '';
+      const greeting = firstName ? 'Hey ' + firstName + '.' : 'Hey.';
+      await bot.sendMessage(chatId,
+        greeting + " I'm Jarvis — your personal AI that actually manages your life, not just answers questions.\n\n" +
+        "I'll remember everything you tell me, proactively check in on your goals, book rides and restaurants, " +
+        "search flights, remind you of things, and get smarter about you over time.\n\n" +
+        "Two things to set me up properly:"
+      );
+      await new Promise(r => setTimeout(r, 800));
+      await sendLocationRequest(chatId, 'set your timezone and city — needed for reminders, local suggestions, and ride booking', false);
+      await new Promise(r => setTimeout(r, 600));
+      await bot.sendMessage(chatId,
+        "Once I have your location, just tell me what you're working on right now — a project, a goal, something you want to stay on top of. " +
+        "I'll start building your profile from there."
+      );
+    } else {
+      // Returning user
+      bot.sendMessage(chatId, "Back online. What do you need?");
+    }
     return;
   }
 
   if (text === '/forget_everything') {
     saveUserData(chatId, emptyUserData());
     bot.sendMessage(chatId, "Done — wiped everything I remembered about you.");
+    return;
+  }
+
+  if (text === '/me') {
+    const d = loadUserData(chatId);
+    const totalMems = d.memories.length;
+    const byCat = {};
+    for (const m of d.memories) (byCat[m.category] = byCat[m.category] || []).push(m.text);
+
+    const locationLine = d.locationPlace
+      ? d.locationPlace + (d.locationTimezone ? ' (' + d.locationTimezone + ')' : '')
+      : 'Not set — share your location to enable reminders and local features';
+
+    const savedPlaces = Object.keys(d.savedAddresses || {});
+    const placesLine = savedPlaces.length
+      ? savedPlaces.join(', ') + ' (' + savedPlaces.length + ' saved)'
+      : 'None saved yet';
+
+    const upcoming = (d.reminders || [])
+      .filter(r => new Date(r.when) > new Date())
+      .sort((a, b) => a.when.localeCompare(b.when))
+      .slice(0, 3);
+    const remindersLine = upcoming.length
+      ? upcoming.map(r => '  • ' + r.text + ' — ' + r.when.slice(0, 10)).join('\n')
+      : '  None upcoming';
+
+    const catSummary = Object.entries(byCat)
+      .map(([cat, items]) => '  ' + cat + ': ' + items.length + ' item' + (items.length > 1 ? 's' : ''))
+      .join('\n');
+
+    const lines = [
+      'Your Jarvis profile:',
+      '',
+      'Location: ' + locationLine,
+      'Saved places: ' + placesLine,
+      'Memories: ' + totalMems + ' total' + (totalMems ? '\n' + catSummary : ''),
+      '',
+      'Upcoming reminders:\n' + remindersLine,
+      '',
+      'Commands: /me  /memories  /forget_everything',
+    ];
+    bot.sendMessage(chatId, lines.join('\n'));
     return;
   }
 
@@ -1576,7 +1724,7 @@ bot.on('message', async (msg) => {
     const lines = Object.entries(byCategory)
       .map(([cat, items]) => `*${cat}*\n` + items.map((m) => `• ${m.text}`).join('\n'))
       .join('\n\n');
-    bot.sendMessage(chatId, `Here's everything I have stored on you (${userData.memories.length} total):\n\n${lines}`, { parse_mode: 'Markdown' });
+    bot.sendMessage(chatId, `Everything stored (${userData.memories.length} items) — use /me for a formatted summary:\n\n${lines}`, { parse_mode: 'Markdown' });
     return;
   }
 
