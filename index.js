@@ -87,7 +87,7 @@ async function initDb(attempt = 1) {
 const DATA_VERSION = 2;
 
 function emptyUserData(username, firstName) {
-  return { version: DATA_VERSION, memories: [], history: [], reminders: [], schedule: [], pendingFollowUps: [], warnedEvents: {}, savedAddresses: {}, username: username || '', firstName: firstName || '' };
+  return { version: DATA_VERSION, memories: [], history: [], reminders: [], schedule: [], pendingFollowUps: [], warnedEvents: {}, savedAddresses: {}, people: [], username: username || '', firstName: firstName || '' };
 }
 
 function applyBackfill(data) {
@@ -103,8 +103,10 @@ function applyBackfill(data) {
   if (typeof data.locationUtcOffset === 'undefined') data.locationUtcOffset = 0;
   if (typeof data.locationTimezone  === 'undefined') data.locationTimezone  = 'UTC';
   if (typeof data.lastWeeklyReview  === 'undefined') data.lastWeeklyReview  = '';
+  if (typeof data.lastRecapDate     === 'undefined') data.lastRecapDate     = '';
   if (typeof data.checkinSlots      === 'undefined') data.checkinSlots      = {};
   if (typeof data.savedAddresses    === 'undefined') data.savedAddresses    = {};
+  if (!Array.isArray(data.people))               data.people               = [];
   data.version = DATA_VERSION;
   return data;
 }
@@ -613,6 +615,30 @@ const tools = [
         event_id: { type: 'string', description: 'ID of the event to remove' },
         title_keyword: { type: 'string', description: 'Keyword to find the event by title if ID unknown' },
         date: { type: 'string', description: 'Date to narrow down the search YYYY-MM-DD. Optional.' },
+      },
+    },
+  },
+  {
+    name: 'track_person',
+    description: 'Save or update a person in the user\'s relationship tracker. Use whenever a person is mentioned who matters to the user — family, friends, colleagues, clients. Tracks the relationship type, notes about them, and optionally how often the user wants to stay in touch. Call this proactively when learning about someone new.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        name:            { type: 'string', description: 'Full name or nickname' },
+        relationship:    { type: 'string', description: 'e.g. friend, colleague, client, sister, boss, mentor' },
+        notes:           { type: 'string', description: 'Key facts: what they do, where they live, current situation, anything worth remembering' },
+        reach_out_days:  { type: 'integer', description: 'How many days between check-ins. E.g. 14 = nudge every 2 weeks. Omit if no cadence needed.' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'get_people',
+    description: 'List all tracked people in the user\'s relationship tracker. Use when user asks about someone they\'ve mentioned before, or to check who is due for a catch-up.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        filter: { type: 'string', description: 'Optional: filter by name or relationship type' },
       },
     },
   },
@@ -1358,6 +1384,8 @@ TOOLS:
 - remember_fact / recall_memory / forget_fact: your memory tools — use constantly.
 - Images/photos: when the user sends a photo (receipt, screenshot, menu, document, business card, anything), you receive it with full vision. Extract all useful information and save key facts to memory immediately. Receipts → save amounts/vendors to [finance]. Business cards → save contact to [person]. Menus → answer questions about them. Documents → summarise and extract action items.
 - fetch_url: ALWAYS call this when any URL appears in the conversation. Never guess or paraphrase a URL you have not read. Fetch it, extract what matters, save key facts to memory.
+- track_person: save or update a person in the relationship tracker. Call this proactively whenever the user mentions someone who matters to them — don't wait to be asked. If they mention their colleague Jake, save Jake. If they mention their girlfriend, save her. If they mention a client, save the client. Include relationship type and any notes from context.
+- get_people: list all tracked people, optionally filtered. Use when user asks about someone or wants to see their contacts.
 - track_followup: use whenever user says they will do something or need to follow up on something. Examples: 'I need to call the dentist', 'I will email John tomorrow', 'I should follow up on the proposal'. Save every one.
 - resolve_followup: when user says they completed something tracked as a follow-up, find and mark it resolved.
 - add_event: save ANY time-specific commitment the user mentions — meetings, calls, appointments, gym sessions, flights, dinners, deadlines, classes. Do this proactively without being asked. If they say 'I have a call tomorrow at 3' → add_event immediately.
@@ -1578,6 +1606,31 @@ async function callClaude(chatId, userText, wasVoice, username) {
         } else if (block.name === 'make_booking_call') {
           result = await makeBookingCall(chatId, block.input);
           totalEventCounts.calls = (totalEventCounts.calls || 0) + 1;
+        } else if (block.name === 'track_person') {
+          if (!Array.isArray(userData.people)) userData.people = [];
+          const { name, relationship, notes, reach_out_days } = block.input;
+          const existing = userData.people.find(p => p.name.toLowerCase() === name.toLowerCase());
+          if (existing) {
+            if (relationship)   existing.relationship  = relationship;
+            if (notes)          existing.notes         = (existing.notes ? existing.notes + ' | ' : '') + notes;
+            if (reach_out_days) existing.reach_out_days = reach_out_days;
+            existing.lastMentioned = new Date().toISOString();
+            result = { ok: true, updated: true, name, message: 'Updated ' + name };
+          } else {
+            userData.people.push({ name, relationship: relationship || 'contact', notes: notes || '', reach_out_days: reach_out_days || null, lastMentioned: new Date().toISOString(), addedAt: new Date().toISOString() });
+            result = { ok: true, added: true, name, message: 'Saved ' + name };
+          }
+          saveUserData(chatId, userData);
+        } else if (block.name === 'get_people') {
+          if (!Array.isArray(userData.people) || !userData.people.length) {
+            result = { ok: true, people: [], message: 'No people tracked yet.' };
+          } else {
+            const filter = (block.input.filter || '').toLowerCase();
+            const list = filter
+              ? userData.people.filter(p => p.name.toLowerCase().includes(filter) || (p.relationship||'').toLowerCase().includes(filter))
+              : userData.people;
+            result = { ok: true, people: list, count: list.length };
+          }
         } else {
           result = { error: 'Unknown tool' };
         }
@@ -2019,20 +2072,19 @@ bot.on('message', async (msg) => {
     const isNewUser = !existingData.memories.length && !existingData.locationPlace;
 
     if (isNewUser) {
-      // Rich onboarding for first-time users
       const firstName = msg.from?.first_name || '';
-      const greeting = firstName ? 'Hey ' + firstName + '.' : 'Hey.';
+      const greeting = firstName ? 'Hey ' + firstName + '!' : 'Hey!';
       await bot.sendMessage(chatId,
-        greeting + " I'm Jarvis — your personal AI that actually manages your life, not just answers questions.\n\n" +
-        "I'll remember everything you tell me, proactively check in on your goals, book rides and restaurants, " +
-        "search flights, remind you of things, and get smarter about you over time.\n\n" +
-        "Two things to set me up properly:"
+        greeting + " I'm Jarvis — your personal AI, available 24/7 right here on Telegram.\n\n" +
+        "I remember everything, manage your schedule, book things, track your goals, and check in on you proactively. " +
+        "The more we talk, the more useful I get.\n\n" +
+        "Let me set up two things quickly:"
       );
       await new Promise(r => setTimeout(r, 800));
-      await sendLocationRequest(chatId, 'set your timezone and city — needed for reminders, local suggestions, and ride booking', false);
+      await sendLocationRequest(chatId, 'set your timezone for reminders and local suggestions', false);
       await new Promise(r => setTimeout(r, 600));
       await bot.sendMessage(chatId,
-        "Once I have your location, just tell me what you're working on right now — a project, a goal, something you want to stay on top of. " +
+        "While that loads — tell me: what do you do for work, and what's the one thing on your mind most right now? " +
         "I'll start building your profile from there."
       );
     } else {
@@ -2298,6 +2350,70 @@ async function checkUpcomingDeadlines() {
 // ─── Proactive: morning briefing ─────────────────────────────────────────────
 // Runs every 15 min. At 8:00–8:14 AM local time, sends each user a short
 // AI-generated briefing of today + the next 7 days. Only once per calendar day.
+async function sendEveningRecap() {
+  for (const [chatId, userData] of Object.entries(userDataCache)) {
+    const hasContent = (userData.memories && userData.memories.length > 2) || (userData.schedule && userData.schedule.length);
+    if (!hasContent) continue;
+
+    const utcOffsetHrs = userData.locationUtcOffset || 0;
+    const nowUtc = new Date();
+    const localMs = nowUtc.getTime() + utcOffsetHrs * 3600000;
+    const localDate = new Date(localMs);
+    const localHour = localDate.getUTCHours();
+    const localMin = localDate.getUTCMinutes();
+
+    if (localHour !== 21 || localMin >= 15) continue;
+
+    const todayStr = localDate.toISOString().slice(0, 10);
+    if (userData.lastRecapDate === todayStr) continue;
+    userData.lastRecapDate = todayStr;
+    saveUserData(chatId, userData);
+
+    const todayEvents = (userData.schedule || [])
+      .filter(e => e.date === todayStr)
+      .sort((a, b) => (a.startTime || '').localeCompare(b.startTime || ''))
+      .map(e => '- ' + (e.startTime || '') + ' ' + e.title)
+      .join('\n');
+
+    const tomorrowStr = new Date(localMs + 86400000).toISOString().slice(0, 10);
+    const tomorrowEvents = (userData.schedule || [])
+      .filter(e => e.date === tomorrowStr)
+      .sort((a, b) => (a.startTime || '').localeCompare(b.startTime || ''))
+      .map(e => '- ' + (e.startTime || '') + ' ' + e.title)
+      .join('\n');
+
+    const pendingTasks = (userData.pendingFollowUps || [])
+      .filter(f => !f.resolved).map(f => '- ' + f.text).join('\n');
+
+    const recentMemories = (userData.memories || [])
+      .sort((a, b) => (b.updatedAt || b.date || '').localeCompare(a.updatedAt || a.date || ''))
+      .slice(0, 20).map(m => '[' + m.category + '] ' + m.text).join('\n');
+
+    const prompt =
+      'You are Jarvis, the user\'s personal AI. It\'s 9PM. Send a short evening wrap-up — max 4 sentences. ' +
+      'Cover: one thing that happened today worth acknowledging, anything unfinished that matters, and one thing to be ready for tomorrow. ' +
+      'Tone: warm, direct, like a friend checking in at the end of the day. Not a report. Not bullet points. ' +
+      'If there is genuinely nothing to say, respond with: NO_RECAP\n\n' +
+      'TODAY\'S EVENTS:\n' + (todayEvents || 'None.') + '\n\n' +
+      'TOMORROW\'S EVENTS:\n' + (tomorrowEvents || 'None scheduled.') + '\n\n' +
+      'PENDING TASKS:\n' + (pendingTasks || 'None.') + '\n\n' +
+      'RECENT MEMORIES:\n' + recentMemories;
+
+    try {
+      const resp = await anthropic.messages.create({
+        model: 'claude-sonnet-4-5', max_tokens: 200,
+        messages: [{ role: 'user', content: prompt }],
+      });
+      const text = resp.content.find(b => b.type === 'text')?.text?.trim();
+      if (text && text !== 'NO_RECAP' && !text.startsWith('NO_RECAP')) {
+        await bot.sendMessage(chatId, text).catch(() => {});
+      }
+    } catch (err) {
+      console.error('Evening recap error:', err.message);
+    }
+  }
+}
+
 async function sendMorningBriefings() {
   for (const [chatId, userData] of Object.entries(userDataCache)) {
 
@@ -2569,7 +2685,12 @@ async function sendProactiveCheckin() {
       "MEMORIES:\n" + allMemories + "\n\n" +
       "TODAY'S EVENTS:\n" + (upcomingEvents || 'None scheduled.') + "\n\n" +
       "REMINDERS TODAY:\n" + (upcomingToday || 'None.') + "\n\n" +
-      "PENDING TASKS:\n" + (pendingTasks || 'None.')
+      "PENDING TASKS:\n" + (pendingTasks || 'None.') + "\n\n" +
+      "PEOPLE TRACKER:\n" + ((userData.people || []).slice(0, 10).map(person => {
+        const daysSince = person.lastMentioned ? Math.floor((Date.now() - new Date(person.lastMentioned).getTime()) / 86400000) : null;
+        const due = person.reach_out_days && daysSince !== null && daysSince >= person.reach_out_days;
+        return (due ? '[OVERDUE] ' : '') + person.name + ' (' + person.relationship + ')' + (daysSince !== null ? ' — last mentioned ' + daysSince + 'd ago' : '');
+      }).join('\n') || 'None tracked yet.')
 
     try {
       const resp = await anthropic.messages.create({
@@ -2649,6 +2770,7 @@ setInterval(checkUpcomingDeadlines, 60 * 60 * 1000); // hourly: 3-day and 1-day 
 setInterval(sendMorningBriefings, 15 * 60 * 1000);   // every 15 min: 8 AM local briefing
 setInterval(sendWeeklyReview, 15 * 60 * 1000);        // every 15 min: Sunday 7 PM life review
 setInterval(sendProactiveCheckin, 30 * 60 * 1000);    // every 30 min: 10AM/2PM/6PM goal-aware nudge
+setInterval(sendEveningRecap,     15 * 60 * 1000);    // every 15 min: 9PM evening wrap-up
 setInterval(checkFollowupNudges,  30 * 60 * 1000);    // every 30 min: nudge overdue tracked tasks
 
 // ---------- Webhook server (Vapi call outcomes) ----------
