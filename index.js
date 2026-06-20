@@ -982,6 +982,12 @@ function summarizeCallOutcome(message) {
 }
 
 const webhookServer = http.createServer((req, res) => {
+  // Railway health check
+  if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('OK');
+    return;
+  }
   if (req.method === 'POST' && req.url === '/vapi-webhook') {
     let body = '';
     req.on('data', (chunk) => { body += chunk; });
