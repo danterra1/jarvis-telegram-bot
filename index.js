@@ -4,6 +4,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import fs from 'fs';
 import path from 'path';
 import http from 'http';
+import pg from 'pg'; // used only for one-time Railway→Replit migration
 
 // ---------- Config ----------
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -3128,6 +3129,49 @@ async function migrateExistingUsers() {
   console.log('[migrate] Done. Synced:', synced, 'Skipped:', skipped);
 }
 await initDb();
+
+// One-time migration: if Replit DB is empty and Railway Postgres is present, import all users
+async function migrateFromRailwayDb() {
+  if (!process.env.DATABASE_URL) return;
+  try {
+    // Only migrate if Replit DB is empty
+    const check = await fetch(REPLIT_API + '/api/bot-data/all', {
+      headers: DB_HEADERS, signal: AbortSignal.timeout(5000),
+    });
+    if (!check.ok) return;
+    const existing = await check.json();
+    if (existing.length > 0) {
+      console.log('[migrate] Replit DB already has', existing.length, 'users — skipping Railway migration.');
+      return;
+    }
+    console.log('[migrate] Replit DB is empty — importing from Railway Postgres...');
+    const migPool = new pg.Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
+      max: 2,
+    });
+    const res = await migPool.query('SELECT chat_id, data FROM user_data');
+    await migPool.end();
+    let migrated = 0;
+    for (const row of res.rows) {
+      const data = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
+      const r = await fetch(REPLIT_API + '/api/bot-data/' + String(row.chat_id), {
+        method: 'PUT', headers: DB_HEADERS, body: JSON.stringify(data),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (r.ok) {
+        userDataCache[String(row.chat_id)] = applyBackfill(data);
+        migrated++;
+        console.log('[migrate] Imported chatId', row.chat_id, '| name:', data.firstName || data.username || '(unknown)');
+      }
+    }
+    console.log('[migrate] Done. Migrated', migrated, 'of', res.rows.length, 'users to Replit DB.');
+  } catch (err) {
+    console.error('[migrate] Railway migration failed:', err.message);
+  }
+}
+await migrateFromRailwayDb();
+
 bot.startPolling(); // start AFTER cache is warm
 
 migrateExistingUsers();
