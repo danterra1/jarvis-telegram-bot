@@ -438,14 +438,13 @@ const tools = [
   },
   {
     name: 'shop_online',
-    description: "Search for products across Amazon, AliExpress, Shein, and eBay. Use when the user wants to buy anything online. Intelligently picks the best platforms based on the product type: electronics/tech -> Amazon + AliExpress; fashion/clothing -> Shein + Amazon; cheap/bulk items -> AliExpress first; general -> all platforms. Returns pre-filled search links for each relevant platform. Save any mentioned budget or preferences to memory.",
+    description:
+      'Find 3 specific products to buy via live search. Use for ANY shopping request — electronics, clothing, home goods, gifts, anything. Returns real product page links as tappable buttons. Save budget if mentioned.',
     input_schema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Product search query, e.g. "wireless headphones", "summer dress", "phone case for iPhone 15".' },
-        category: { type: 'string', enum: ['electronics', 'fashion', 'home', 'beauty', 'sports', 'toys', 'general'], description: 'Product category to pick the best platforms. Use general if unsure.' },
-        budget: { type: 'string', description: 'Budget hint if user mentioned one, e.g. "under $30", "cheap", "premium".' },
-        platforms: { type: 'array', items: { type: 'string' }, description: 'Specific platforms: amazon, aliexpress, shein, ebay. Leave empty to auto-select based on category.' },
+        query:  { type: 'string', description: 'What to search for, e.g. "wireless headphones" or "blue running shoes size 10"' },
+        budget: { type: 'string', description: 'Optional budget constraint, e.g. "under $50" or "around $200"' },
       },
       required: ['query'],
     },
@@ -1437,7 +1436,7 @@ async function callClaude(chatId, userText, wasVoice, username) {
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
-      max_tokens: 600,
+      max_tokens: 1500,
       system: buildSystemPrompt(userData),
       messages: userData.history,
       tools,
