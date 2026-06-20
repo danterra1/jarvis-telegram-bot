@@ -82,7 +82,7 @@ async function initDb(attempt = 1) {
 const DATA_VERSION = 2;
 
 function emptyUserData(username, firstName) {
-  return { version: DATA_VERSION, memories: [], history: [], reminders: [], schedule: [], pendingFollowUps: [], warnedEvents: {}, savedAddresses: {}, people: [], dailyMsgDate: '', dailyMsgCount: 0, username: username || '', firstName: firstName || '' };
+  return { version: DATA_VERSION, memories: [], history: [], reminders: [], schedule: [], pendingFollowUps: [], warnedEvents: {}, savedAddresses: {}, people: [], dailyMsgDate: '', dailyMsgCount: 0, username: username || '', firstName: firstName || '', firstSeenDate: new Date().toISOString().slice(0, 10) };
 }
 
 function applyBackfill(data) {
@@ -1284,12 +1284,30 @@ function buildSystemPrompt(userData) {
     _validSched.length ? '(' + _validSched.length + ' total events in calendar)' : '(Calendar is empty — add events as the user mentions them)',
   ].join('\n');
 
+  // Relationship depth — tone evolves with total messages
+  const _totalMsgs = Array.isArray(userData.history) ? userData.history.length : 0;
+  const _relationshipLevel =
+    _totalMsgs < 10  ? 'NEW — just meeting them. Be warm and curious, start learning who they are.' :
+    _totalMsgs < 40  ? 'GETTING CLOSE — you know a little. Reference what you know, feel less formal.' :
+    _totalMsgs < 100 ? 'FAMILIAR — you know them well. Be direct, skip pleasantries, feel like a real friend.' :
+                       'OLD FRIENDS — know this person deeply. Be direct, witty, reference specific things. Never act like a stranger.';
+
+  // Top 5 recent memories for dot-connection
+  const _recentMems = (userData.memories || [])
+    .sort((a,b) => (b.updatedAt||b.date).localeCompare(a.updatedAt||a.date))
+    .slice(0, 5).map(m => '['+m.category+'] '+m.text).join(' | ');
+  const _pendingFUs = (userData.pendingFollowUps||[]).filter(f=>!f.resolved)
+    .slice(0,3).map(f => f.text).join(' | ');
+
   const userIdentity = (userData.firstName || userData.username)
     ? 'YOU ARE TALKING TO: ' + (userData.firstName || '') + (userData.username ? ' (@' + userData.username + ')' : '') + '. Use their name naturally the way a real friend does — not every message, but occasionally.'
     : "You don't know this user's name yet — ask naturally early in the conversation.";
   const base = `You are Jarvis — the user's personal AI and closest digital companion, available 24/7 on Telegram.
 
 ${userIdentity} Think of yourself as the brilliant friend who's always got their back: you remember everything, get things done fast, give real advice, and aren't afraid to crack a joke. The current UTC date/time is ${nowIso}.
+
+RELATIONSHIP DEPTH: ${_relationshipLevel}
+${_recentMems ? 'RECENT MEMORIES: '+_recentMems+'\n' : ''}${_pendingFUs ? 'PENDING FOLLOW-UPS: '+_pendingFUs+'\n' : ''}
 
 CORE ROLE — LIFE MANAGEMENT:
 You actively manage the user's life, not just respond to requests. This means:
@@ -1305,6 +1323,9 @@ You have a durable long-term memory store (saved to disk, persists forever). Cat
 - When something changes, use forget_fact and re-save with the update. Keep the store accurate.
 - Before answering anything about them, call recall_memory if you're not sure you have everything — your visible list is just a fast-access subset, not the full store.
 - Group and organize: use the right category. Project details go in [project], health updates in [health], financial goals in [finance], recurring behaviors in [habit].
+
+CONNECT THE DOTS — EVERY MESSAGE:
+Before replying, scan memory for anything that connects to what they just said. Did they mention this before? Did they say they'd do this? Call it out. 'Wasn't this the meeting you were nervous about?' or 'You mentioned this project was behind.' These callbacks make you feel like a real friend who actually remembers.
 
 PROACTIVE MANAGEMENT — THIS IS YOUR MOST IMPORTANT FUNCTION:
 Before you answer ANY request, run it through the user's known goals, finances, health plans, and habits. If there's a conflict or a risk, flag it naturally WHILE still helping — don't refuse, don't lecture, just be honest like a friend who's also their manager.
@@ -2738,8 +2759,8 @@ async function sendProactiveCheckin() {
 
   for (const [chatId, userData] of Object.entries(userDataCache)) {
 
-    // Need real life context to check in meaningfully
-    if (!userData.memories || userData.memories.length < 3) continue;
+    // Even 1 memory is enough for a meaningful check-in
+    if (!userData.memories || userData.memories.length < 1) continue;
 
     const utcOffsetHrs = userData.locationUtcOffset || 0;
     const nowUtc = new Date();
