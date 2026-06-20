@@ -763,20 +763,24 @@ function searchFlights(input) {
   const cabinMap = { economy: 'economy', premium_economy: 'premiumeconomy', business: 'business', first: 'first' };
   const skyClass = cabinMap[cabin] || 'economy';
 
-  // Google Flights — accepts city names directly
+  // Google Flights — structured pre-filled URL with origin, destination, dates, pax
   const tripType  = ret ? 'round trip' : 'one way';
-  const googleQ   = encodeURIComponent('flights from ' + origin + ' to ' + destination);
-  const googleUrl = 'https://www.google.com/travel/flights?q=' + googleQ;
+  const googleParts = ['flights from ' + fromCode + ' to ' + toCode, 'on ' + dep];
+  if (ret) googleParts.push('return ' + ret);
+  if (pax > 1) googleParts.push(pax + ' passengers');
+  if (cabin !== 'economy') googleParts.push(cabin + ' class');
+  const googleUrl = 'https://www.google.com/travel/flights?q=' + encodeURIComponent(googleParts.join(' '));
 
   // Skyscanner
   let skyUrl = 'https://www.skyscanner.com/transport/flights/' + fromCode + '/' + toCode + '/' + skyDep + '/';
   if (skyRet) skyUrl += skyRet + '/';
-  if (pax > 1 || skyClass !== 'economy') skyUrl += '?adults=' + pax + '&cabinclass=' + skyClass;
+  skyUrl += '?adults=' + pax + '&cabinclass=' + skyClass;
 
   // Kayak
   let kayakUrl = 'https://www.kayak.com/flights/' + fromCode + '-' + toCode + '/' + dep;
   if (ret) kayakUrl += '/' + ret;
-  if (pax > 1) kayakUrl += '/' + pax + 'adults';
+  kayakUrl += '/' + pax + 'adults';
+  if (cabin !== 'economy') { const kayakCabin = { premium_economy:'premiumeconomy', business:'business', first:'first' }[cabin] || cabin; kayakUrl += '?cabin=' + kayakCabin; }
 
   const legs = ret
     ? origin + ' to ' + destination + ' on ' + dep + ', return ' + ret
