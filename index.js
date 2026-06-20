@@ -1497,16 +1497,14 @@ async function sendWeeklyReview() {
     const allMemories = (userData.memories || [])
       .sort((a, b) => (b.updatedAt || b.date).localeCompare(a.updatedAt || a.date))
       .map((m) => '[' + m.category + '] ' + m.text)
-      .join('
-');
+      .join('\n');
 
     const upcomingReminders = (userData.reminders || [])
       .filter(r => new Date(r.when).getTime() > localMs)
       .sort((a, b) => new Date(a.when) - new Date(b.when))
       .slice(0, 10)
       .map(r => '- ' + r.text + ' (' + new Date(r.when).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }) + ')')
-      .join('
-');
+      .join('\n');
 
     const reviewPrompt = 'You are Jarvis, the user\'s personal life manager. It\'s Sunday evening — time for a brief weekly review. ' +
       'Based on everything you know about them below, write a thoughtful weekly wrap-up message in 5-8 sentences. ' +
@@ -1582,8 +1580,7 @@ async function sendProactiveCheckin() {
       .sort((a, b) => (b.updatedAt || b.date).localeCompare(a.updatedAt || a.date))
       .slice(0, 30)
       .map(m => '[' + m.category + '] ' + m.text)
-      .join('
-');
+      .join('\n');
 
     const upcomingToday = (userData.reminders || [])
       .filter(r => {
@@ -1592,8 +1589,7 @@ async function sendProactiveCheckin() {
         return t >= localMs && t <= endOfDay;
       })
       .map(r => '- ' + r.text + ' at ' + new Date(r.when).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }))
-      .join('
-');
+      .join('\n');
 
     const timeOfDay = localHour < 12 ? 'morning' : localHour < 17 ? 'afternoon' : 'evening';
     const dayLabel = localDate.toLocaleDateString('en-US', { weekday: 'long' });
