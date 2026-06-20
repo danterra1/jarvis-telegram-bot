@@ -4,6 +4,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import fs from 'fs';
 import path from 'path';
 import http from 'http';
+import pg from 'pg';
 
 // ---------- Config ----------
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -30,16 +31,50 @@ if (!VAPI_KEY) {
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 
-// ---------- Simple file-based persistence ----------
-// Each Telegram user gets their own memory file + conversation history.
-// This file is the durable "long-term memory" store for that user — it is
-// the source of truth Claude can always fall back on, independent of
-// whatever happens to be loaded into its context window on a given turn.
+// ---------- Postgres persistence + in-memory write-through cache ----------
+// Reads: instant, sync, from in-memory cache.
+// Writes: update cache immediately, async-upsert to Postgres in background.
+// On startup: initDb() loads all rows from Postgres into the cache.
+const userDataCache = {};
+
+// Keep DATA_DIR for active_calls.json (ephemeral call state only)
 const DATA_DIR = path.join(process.cwd(), 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
 
-function userFile(chatId) {
-  return path.join(DATA_DIR, `user_${chatId}.json`);
+let pool = null;
+if (process.env.DATABASE_URL) {
+  pool = new pg.Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
+    max: 5,
+  });
+} else {
+  console.warn('DATABASE_URL not set — data lives only in memory and resets on restart.');
+}
+
+const SQL_UPSERT = 'INSERT INTO user_data (chat_id, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (chat_id) DO UPDATE SET data = $2, updated_at = NOW()';
+const SQL_SELECT_ALL = 'SELECT chat_id, data FROM user_data';
+const SQL_CREATE_TABLE = 'CREATE TABLE IF NOT EXISTS user_data (chat_id TEXT PRIMARY KEY, data JSONB NOT NULL, updated_at TIMESTAMPTZ DEFAULT NOW())';
+
+async function dbUpsert(chatId, data) {
+  if (!pool) return;
+  try { await pool.query(SQL_UPSERT, [String(chatId), JSON.stringify(data)]); }
+  catch (err) { console.error('DB upsert failed for', chatId, err.message); }
+}
+
+async function initDb() {
+  if (!pool) { console.warn('No DATABASE_URL — starting with empty in-memory state.'); return; }
+  try {
+    await pool.query(SQL_CREATE_TABLE);
+    const res = await pool.query(SQL_SELECT_ALL);
+    for (const row of res.rows) {
+      const d = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
+      userDataCache[String(row.chat_id)] = applyBackfill(d);
+    }
+    console.log('DB ready. Loaded', res.rows.length, 'users into cache.');
+  } catch (err) {
+    console.error('initDb error:', err.message);
+  }
 }
 
 // Bump this if the on-disk shape ever changes incompatibly.
@@ -49,57 +84,39 @@ function emptyUserData(username, firstName) {
   return { version: DATA_VERSION, memories: [], history: [], reminders: [], schedule: [], pendingFollowUps: [], warnedEvents: {}, username: username || '', firstName: firstName || '' };
 }
 
+function applyBackfill(data) {
+  if (!Array.isArray(data.memories))         data.memories         = [];
+  if (!Array.isArray(data.history))          data.history          = [];
+  if (!Array.isArray(data.reminders))        data.reminders        = [];
+  if (!Array.isArray(data.schedule))         data.schedule         = [];
+  if (!Array.isArray(data.pendingFollowUps)) data.pendingFollowUps = [];
+  if (typeof data.username          === 'undefined') data.username          = '';
+  if (typeof data.firstName         === 'undefined') data.firstName         = '';
+  if (typeof data.warnedReminders   === 'undefined') data.warnedReminders   = {};
+  if (typeof data.warnedEvents      === 'undefined') data.warnedEvents      = {};
+  if (typeof data.locationUtcOffset === 'undefined') data.locationUtcOffset = 0;
+  if (typeof data.locationTimezone  === 'undefined') data.locationTimezone  = 'UTC';
+  if (typeof data.lastWeeklyReview  === 'undefined') data.lastWeeklyReview  = '';
+  if (typeof data.checkinSlots      === 'undefined') data.checkinSlots      = {};
+  if (typeof data.savedAddresses    === 'undefined') data.savedAddresses    = {};
+  data.version = DATA_VERSION;
+  return data;
+}
+
 function loadUserData(chatId) {
-  const file = userFile(chatId);
-  if (fs.existsSync(file)) {
-    try {
-      const data = JSON.parse(fs.readFileSync(file, 'utf8'));
-      // Backfill defaults for older files / partial writes so the rest of
-      // the code never has to null-check these.
-      if (!Array.isArray(data.memories)) data.memories = [];
-      if (typeof data.username === 'undefined') data.username = '';
-      if (typeof data.firstName === 'undefined') data.firstName = '';
-      if (typeof data.warnedReminders === 'undefined') data.warnedReminders = {};
-      if (typeof data.locationUtcOffset === 'undefined') data.locationUtcOffset = 0;
-      if (typeof data.locationTimezone === 'undefined') data.locationTimezone = 'UTC';
-      if (typeof data.lastWeeklyReview === 'undefined') data.lastWeeklyReview = '';
-      if (typeof data.checkinSlots === 'undefined') data.checkinSlots = {};
-      if (typeof data.savedAddresses === 'undefined') data.savedAddresses = {};
-      if (!Array.isArray(data.pendingFollowUps)) data.pendingFollowUps = [];
-      if (!Array.isArray(data.schedule)) data.schedule = [];
-      if (typeof data.warnedEvents === 'undefined') data.warnedEvents = {};
-      if (!Array.isArray(data.history)) data.history = [];
-      if (!Array.isArray(data.reminders)) data.reminders = [];
-      data.version = DATA_VERSION;
-      return data;
-    } catch (e) {
-      // Corrupt file — don't silently wipe the user's memory. Keep the
-      // broken file around for inspection/recovery and start a fresh
-      // in-memory object for this turn only; it will be saved fresh on
-      // the next successful write, but we log loudly so this is visible.
-      console.error(`Failed to parse user data for ${chatId}, file may be corrupt:`, e);
-      try {
-        fs.copyFileSync(file, file + '.corrupt-' + Date.now());
-      } catch (copyErr) {
-        console.error('Could not back up corrupt user file:', copyErr);
-      }
-      return emptyUserData();
-    }
-  }
-  return emptyUserData();
+  const key = String(chatId);
+  if (userDataCache[key]) return userDataCache[key];
+  const fresh = emptyUserData();
+  userDataCache[key] = fresh;
+  return fresh;
 }
 
 // Atomic-ish write: write to a temp file then rename, so a crash mid-write
 // never leaves a half-written / corrupt JSON file on disk.
 function saveUserData(chatId, data) {
-  const file = userFile(chatId);
-  const tmp = file + '.tmp';
-  try {
-    fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
-    fs.renameSync(tmp, file);
-  } catch (err) {
-    console.error(`Failed to save user data for ${chatId}:`, err);
-  }
+  const key = String(chatId);
+  userDataCache[key] = data;  // sync — instant
+  dbUpsert(key, data);        // async — fire and forget
 }
 
 // ---------- Memory helpers ----------
@@ -2132,23 +2149,9 @@ async function sendReminderWithSuggestions(chatId, reminder) {
 }
 
 async function checkReminders() {
-  let files;
-  try {
-    files = fs.readdirSync(DATA_DIR).filter((f) => f.startsWith('user_') && f.endsWith('.json') && !f.includes('.corrupt-') && !f.endsWith('.tmp'));
-  } catch (err) {
-    return;
-  }
-
   const now = Date.now();
 
-  for (const file of files) {
-    const chatId = file.slice('user_'.length, -'.json'.length);
-    let userData;
-    try {
-      userData = JSON.parse(fs.readFileSync(path.join(DATA_DIR, file), 'utf8'));
-    } catch (err) {
-      continue;
-    }
+  for (const [chatId, userData] of Object.entries(userDataCache)) {
     if (!userData.reminders || !userData.reminders.length) continue;
 
     const due = userData.reminders.filter((r) => new Date(r.when).getTime() <= now);
@@ -2177,21 +2180,9 @@ async function checkReminders() {
 // Runs hourly. For each user, sends a heads-up if a reminder is 3 days or
 // 1 day away — only once per threshold per reminder (tracked in warnedReminders).
 async function checkUpcomingDeadlines() {
-  let files;
-  try {
-    files = fs.readdirSync(DATA_DIR).filter(
-      (f) => f.startsWith('user_') && f.endsWith('.json') && !f.includes('.corrupt-') && !f.endsWith('.tmp')
-    );
-  } catch (_) { return; }
-
   const now = Date.now();
 
-  for (const file of files) {
-    const chatId = file.slice('user_'.length, -'.json'.length);
-    let userData;
-    try {
-      userData = JSON.parse(fs.readFileSync(path.join(DATA_DIR, file), 'utf8'));
-    } catch (_) { continue; }
+  for (const [chatId, userData] of Object.entries(userDataCache)) {
 
     if (!userData.reminders || !userData.reminders.length) continue;
     if (!userData.warnedReminders) userData.warnedReminders = {};
@@ -2238,19 +2229,7 @@ async function checkUpcomingDeadlines() {
 // Runs every 15 min. At 8:00–8:14 AM local time, sends each user a short
 // AI-generated briefing of today + the next 7 days. Only once per calendar day.
 async function sendMorningBriefings() {
-  let files;
-  try {
-    files = fs.readdirSync(DATA_DIR).filter(
-      (f) => f.startsWith('user_') && f.endsWith('.json') && !f.includes('.corrupt-') && !f.endsWith('.tmp')
-    );
-  } catch (_) { return; }
-
-  for (const file of files) {
-    const chatId = file.slice('user_'.length, -'.json'.length);
-    let userData;
-    try {
-      userData = JSON.parse(fs.readFileSync(path.join(DATA_DIR, file), 'utf8'));
-    } catch (_) { continue; }
+  for (const [chatId, userData] of Object.entries(userDataCache)) {
 
     // Only brief users who have some content to talk about
     const hasContent =
@@ -2384,19 +2363,7 @@ async function sendMorningBriefings() {
 // Every Sunday between 19:00-19:14 local time, Claude reviews all the user's
 // memories and sends a weekly summary + questions to learn more about them.
 async function sendWeeklyReview() {
-  let files;
-  try {
-    files = fs.readdirSync(DATA_DIR).filter(
-      (f) => f.startsWith('user_') && f.endsWith('.json') && !f.includes('.corrupt-') && !f.endsWith('.tmp')
-    );
-  } catch (_) { return; }
-
-  for (const file of files) {
-    const chatId = file.slice('user_'.length, -'.json'.length);
-    let userData;
-    try {
-      userData = JSON.parse(fs.readFileSync(path.join(DATA_DIR, file), 'utf8'));
-    } catch (_) { continue; }
+  for (const [chatId, userData] of Object.entries(userDataCache)) {
 
     const hasContent = (userData.memories && userData.memories.length > 2);
     if (!hasContent) continue;
@@ -2459,21 +2426,9 @@ async function sendWeeklyReview() {
 // user's life context and fires a proactive nudge IF there's something worth
 // saying. Not every slot produces a message — Claude decides based on context.
 async function sendProactiveCheckin() {
-  let files;
-  try {
-    files = fs.readdirSync(DATA_DIR).filter(
-      (f) => f.startsWith('user_') && f.endsWith('.json') && !f.includes('.corrupt-') && !f.endsWith('.tmp')
-    );
-  } catch (_) { return; }
-
   const CHECKIN_HOURS = [10, 14, 18]; // 10 AM, 2 PM, 6 PM local
 
-  for (const file of files) {
-    const chatId = file.slice('user_'.length, -'.json'.length);
-    let userData;
-    try {
-      userData = JSON.parse(fs.readFileSync(path.join(DATA_DIR, file), 'utf8'));
-    } catch (_) { continue; }
+  for (const [chatId, userData] of Object.entries(userDataCache)) {
 
     // Need real life context to check in meaningfully
     if (!userData.memories || userData.memories.length < 3) continue;
@@ -2548,13 +2503,7 @@ async function sendProactiveCheckin() {
 
 // Pre-event alerts: 30 min before each scheduled event
 async function checkEventReminders() {
-  let files;
-  try { files = fs.readdirSync(DATA_DIR).filter(f => f.startsWith('user_') && f.endsWith('.json') && !f.includes('.corrupt') && !f.endsWith('.tmp')); }
-  catch (_) { return; }
-  for (const file of files) {
-    const chatId = file.slice('user_'.length, -'.json'.length);
-    let ud;
-    try { ud = JSON.parse(fs.readFileSync(path.join(DATA_DIR, file), 'utf8')); } catch (_) { continue; }
+  for (const [chatId, ud] of Object.entries(userDataCache)) {
     if (!Array.isArray(ud.schedule) || !ud.schedule.length) continue;
     const off = ud.locationUtcOffset || 0;
     const nowLocal = new Date(Date.now() + off * 3600000);
@@ -2691,28 +2640,14 @@ async function reportUsage(username, anthropicTokens, openaiTokens, events = {})
 }
 
 async function migrateExistingUsers() {
-  let files;
-  try {
-    files = fs.readdirSync(DATA_DIR).filter(f =>
-      f.startsWith('user_') && f.endsWith('.json') &&
-      !f.includes('.corrupt-') && !f.endsWith('.tmp')
-    );
-  } catch (e) { return; }
-
-  console.log('[migrate] Found', files.length, 'user files to sync...');
+  const _migrateEntries = Object.entries(userDataCache);
+  console.log('[migrate] Found', _migrateEntries.length, 'users to sync...');
   let synced = 0;
   let skipped = 0;
-  for (const file of files) {
-    const chatId = file.slice('user_'.length, -'.json'.length);
+  for (const [chatId, raw] of _migrateEntries) {
     try {
-      // Read stored identity directly from file — no Telegram API call needed
-      let username = '';
-      let firstName = '';
-      try {
-        const raw = JSON.parse(fs.readFileSync(path.join(DATA_DIR, file), 'utf8'));
-        username = raw.username || '';
-        firstName = raw.firstName || '';
-      } catch (_) {}
+      let username = raw.username || '';
+      let firstName = raw.firstName || '';
 
       // Fall back to Telegram API only if file has no identity stored
       if (!username && !firstName) {
@@ -2739,6 +2674,8 @@ async function migrateExistingUsers() {
   }
   console.log('[migrate] Done. Synced:', synced, 'Skipped:', skipped);
 }
+await initDb();
+
 migrateExistingUsers();
 
 console.log('Jarvis Telegram bot is running...');
