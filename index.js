@@ -361,6 +361,20 @@ const tools = [
     },
   },
   {
+    name: 'shop_online',
+    description: "Search for products across Amazon, AliExpress, Shein, and eBay. Use when the user wants to buy anything online. Intelligently picks the best platforms based on the product type: electronics/tech -> Amazon + AliExpress; fashion/clothing -> Shein + Amazon; cheap/bulk items -> AliExpress first; general -> all platforms. Returns pre-filled search links for each relevant platform. Save any mentioned budget or preferences to memory.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Product search query, e.g. "wireless headphones", "summer dress", "phone case for iPhone 15".' },
+        category: { type: 'string', enum: ['electronics', 'fashion', 'home', 'beauty', 'sports', 'toys', 'general'], description: 'Product category to pick the best platforms. Use general if unsure.' },
+        budget: { type: 'string', description: 'Budget hint if user mentioned one, e.g. "under $30", "cheap", "premium".' },
+        platforms: { type: 'array', items: { type: 'string', enum: ['amazon', 'aliexpress', 'shein', 'ebay'] }, description: 'Specific platforms to search if user asked for them. Leave empty to auto-select based on category.' },
+      },
+      required: ['query'],
+    },
+  },
+  {
     name: 'save_address',
     description: 'Save a named address to the user\'s permanent address book (home, work, gym, sister\'s place, etc.). Use whenever the user mentions where someone or somewhere is — proactively, without being asked. Geocodes the address to lat/lon so rides can be booked later without asking again.',
     input_schema: {
@@ -683,6 +697,53 @@ function searchHotels(input) {
   };
 }
 
+// ---------- Online shopping (Amazon, AliExpress, Shein, eBay) ----------
+function shopOnline(input) {
+  const { query, category = 'general', budget, platforms } = input;
+  const q = encodeURIComponent(query);
+
+  // Platform URL builders
+  const urls = {
+    amazon:     'https://www.amazon.com/s?k=' + q + '&ref=jarvis',
+    aliexpress: 'https://www.aliexpress.com/wholesale?SearchText=' + q,
+    shein:      'https://www.shein.com/catalog/search.html?q=' + q,
+    ebay:       'https://www.ebay.com/sch/i.html?_nkw=' + q,
+  };
+
+  // Auto-select platforms by category if none specified
+  let selected = platforms && platforms.length ? platforms : (() => {
+    if (category === 'electronics') return ['amazon', 'aliexpress', 'ebay'];
+    if (category === 'fashion')     return ['shein', 'amazon'];
+    if (category === 'beauty')      return ['amazon', 'aliexpress'];
+    if (category === 'home')        return ['amazon', 'aliexpress', 'ebay'];
+    if (category === 'sports')      return ['amazon', 'aliexpress'];
+    if (category === 'toys')        return ['amazon', 'aliexpress'];
+    return ['amazon', 'aliexpress', 'shein', 'ebay']; // general
+  })();
+
+  const results = {};
+  const linkParts = [];
+  for (const platform of selected) {
+    if (urls[platform]) {
+      results[platform + '_link'] = urls[platform];
+      linkParts.push(platform.charAt(0).toUpperCase() + platform.slice(1) + ': ' + urls[platform]);
+    }
+  }
+
+  let msg = 'Search results for "' + query + '"';
+  if (budget) msg += ' (budget: ' + budget + ')';
+  msg += ': ' + linkParts.join(' | ');
+
+  return {
+    ok: true,
+    query,
+    category,
+    platforms: selected,
+    ...results,
+    message: msg,
+  };
+}
+
 // ---------- Online restaurant booking (OpenTable / Resy deep-link) ----------
 async function bookRestaurantOnline(input) {
   const { business_name, location, date_time_iso, party_size, reservation_name, opentable_url, resy_url } = input;
@@ -972,6 +1033,7 @@ TOOLS:
 - book_ride: order a ride — returns Uber AND Bolt links, user picks their app. Resolves saved address labels (home, work, sister, etc.) automatically. Use for any ride/taxi request.
 - order_groceries: generate Wolt and Glovo links for grocery/food delivery. Takes a list of items and the user's city. User picks items in the app.
 - search_hotels: find hotels/Airbnbs — generates pre-filled Booking.com and Airbnb search links with dates, guests, destination. Use for any hotel or accommodation request.
+- shop_online: search Amazon, AliExpress, Shein, eBay. Use for ANY online shopping request. Auto-picks best platforms by product type (electronics -> Amazon+AliExpress, fashion -> Shein+Amazon, etc). Returns direct search links per platform. Always note the user's budget if they mention one and save it to memory.
 - book_restaurant_online: ALWAYS try this first for restaurant bookings. Use web_search to find the restaurant on OpenTable or Resy, pass the URL here, get back a one-tap booking link the user can confirm immediately. No call needed.
 - make_booking_call: FALLBACK ONLY — use only when the restaurant is not found on OpenTable or Resy. Find the phone number via web_search first. Tell the user what you're about to do before calling.
 - remember_fact / recall_memory / forget_fact: your memory tools — use constantly.
@@ -1078,6 +1140,8 @@ async function callClaude(chatId, userText, wasVoice, username) {
           result = await orderGroceries(userData, block.input);
         } else if (block.name === 'search_hotels') {
           result = searchHotels(block.input);
+        } else if (block.name === 'shop_online') {
+          result = shopOnline(block.input);
         } else if (block.name === 'book_restaurant_online') {
           result = await bookRestaurantOnline(block.input);
           totalEventCounts.calls = (totalEventCounts.calls || 0) + 1;
