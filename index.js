@@ -28,7 +28,7 @@ if (!VAPI_KEY) {
   console.warn('VAPI_API_KEY not set — outbound booking calls will not work.');
 }
 
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false }); // polling started AFTER initDb()
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 
 // ---------- Postgres persistence + in-memory write-through cache ----------
@@ -2306,7 +2306,7 @@ bot.on('message', async (msg) => {
       }
       return;
     }
-    const _ud = loadUserData(chatId);
+    const _ud = await loadUserDataAsync(chatId);   // async — loads from DB if cache is cold
     const _today = new Date().toISOString().slice(0, 10);
     if (_ud.dailyMsgDate !== _today) { _ud.dailyMsgDate = _today; _ud.dailyMsgCount = 0; }
     _ud.dailyMsgCount = (_ud.dailyMsgCount || 0) + 1;
@@ -3119,6 +3119,7 @@ async function migrateExistingUsers() {
   console.log('[migrate] Done. Synced:', synced, 'Skipped:', skipped);
 }
 await initDb();
+bot.startPolling(); // start AFTER cache is warm
 
 migrateExistingUsers();
 
