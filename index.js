@@ -28,7 +28,7 @@ if (!VAPI_KEY) {
 }
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
-const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY, defaultHeaders: { 'anthropic-beta': 'prompt-caching-2024-07-31' } });
+const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 
 // ---------- Simple file-based persistence ----------
 // Each Telegram user gets their own memory file + conversation history.
@@ -452,7 +452,7 @@ async function makeBookingCall(chatId, args) {
           firstMessage: `Hi, I'm calling to book a table for ${args.party_size}, for ${args.date_time_description}.`,
           model: {
             provider: 'anthropic',
-            model: 'claude-3-5-haiku-20241022',
+            model: 'claude-3-haiku-20240307',
             messages: [{ role: 'system', content: systemPrompt }],
           },
           voice: { provider: 'playht', voiceId: 'jennifer' },
@@ -592,7 +592,7 @@ async function callClaude(chatId, userText, wasVoice, username) {
 
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
     const response = await anthropic.messages.create({
-      model: 'claude-3-5-haiku-20241022',
+      model: 'claude-3-haiku-20240307',
       max_tokens: 1024,
       system: buildSystemPrompt(userData),
       messages: userData.history,
