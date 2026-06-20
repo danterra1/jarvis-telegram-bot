@@ -306,6 +306,32 @@ const tools = [
     },
   },
   {
+    name: 'save_address',
+    description: 'Save a named address to the user\'s permanent address book (home, work, gym, sister\'s place, etc.). Use whenever the user mentions where someone or somewhere is — proactively, without being asked. Geocodes the address to lat/lon so rides can be booked later without asking again.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        label: { type: 'string', description: 'Short lowercase name: home, work, gym, sister, mom, airport, etc.' },
+        address: { type: 'string', description: 'Full street address including city and country if known.' },
+      },
+      required: ['label', 'address'],
+    },
+  },
+  {
+    name: 'book_ride',
+    description: 'Order an Uber ride for the user. ALWAYS check saved addresses first — user says "take me home" means look up label=home in savedAddresses. Returns a one-tap Uber deep-link and a Google Maps backup link. User opens the Uber link and taps Confirm once in the Uber app. If no dropoff is known, list their saved addresses and ask.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        dropoff_label: { type: 'string', description: 'Label of a saved address, e.g. home, work, sister. Use if user named a saved place.' },
+        dropoff_address: { type: 'string', description: 'Full address string if no saved label. Geocoded automatically.' },
+        pickup_label: { type: 'string', description: 'Label of saved pickup address. Omit to use current GPS location.' },
+        pickup_address: { type: 'string', description: 'Full pickup address if not using current location.' },
+      },
+      required: [],
+    },
+  },
+  {
     name: 'set_reminder',
     description:
       "Schedule a reminder that will be proactively sent to the user at a specific future time, even if they haven't messaged you. Use this whenever the user asks to be reminded or pinged about something at a specific time or after a delay (e.g. 'remind me in 20 minutes', 'ping me tomorrow at 9am about the meeting'), or for recurring things like birthdays or anniversaries. You must convert their request into an exact ISO 8601 datetime using the current date/time and their timezone if known. If the thing being scheduled is naturally yearly (birthday, anniversary) ask the user if they want it to repeat every year, and set recurrence accordingly.",
