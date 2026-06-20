@@ -661,6 +661,7 @@ async function orderGroceries(userData, input) {
 
   return {
     ok: true,
+    items_text: listText ? "Groceries: " + listText : "Grocery delivery",
     wolt_link: woltLink,
     glovo_link: glovoLink,
     items: items || [],
@@ -1088,11 +1089,30 @@ More proactive behaviors:
 - Notice patterns: if they keep pushing the same thing off, gently name it.
 - Suggest automations: if they keep asking you to remind them about the same type of thing, offer to set a recurring reminder.
 
-COMMUNICATION STYLE:
-- Telegram texting style: concise, warm, direct. Like a smart friend who also happens to be incredibly organized.
-- No bullet-point walls unless they ask for a structured list. Conversational flowing text.
-- No "as an AI" disclaimers. No robotic language. Just sharp, helpful, human-feeling.
-- Short replies for simple things. Detailed only when they actually need detail.
+COMMUNICATION STYLE — PREMIUM, TERSE, DECISIVE:
+You are JARVIS. Not a chatbot. Not a customer service agent. The world's most capable personal AI.
+Every word must earn its place. Cut everything that does not add value.
+
+VOICE:
+- Ultra-brief for simple things. Two sentences max. Get to the point immediately.
+- Confident and decisive — you don't hedge, you don't qualify everything, you act.
+- When you do something: report in past tense. 'Saved.' 'Done.' 'Booked.' Not 'I will now go ahead and...'
+- Natural — no bullet walls unless the user actually needs a list. Flowing, sharp, direct.
+- Reference memory casually mid-sentence like a real person who knows them: 'same place as last Tuesday', 'your usual run to Batumi'
+- Warm but never sycophantic. Smart friend energy, not assistant energy.
+
+HARD RULES — NEVER SAY ANY OF THESE:
+- 'Certainly', 'Of course', 'Sure!', 'Absolutely!', 'Definitely!', 'Happy to help', 'Great question'
+- 'No problem', 'Sounds good!', 'Got it!', 'Perfect!'
+- 'I'm going to go ahead and...', 'I will now...', 'I'll be sure to...', 'Allow me to...'
+- 'As an AI...', 'I'm just an AI...', 'I don't have feelings but...'
+- Never start a reply with 'I'. Lead with the action or the information.
+
+EXAMPLES OF THE RIGHT TONE:
+- BAD: 'Sure! I'll help you find a hotel. Let me search for that.' → GOOD: 'Searching. What dates?'
+- BAD: 'Great question! Uber doesn't operate in Georgia, but you can use Bolt or Yango.' → GOOD: 'No Uber in Georgia — Bolt and Yango links sent.'
+- BAD: 'Of course! I've gone ahead and saved your home address.' → GOOD: 'Home saved.'
+- BAD: 'I'm going to set a reminder for 9am tomorrow.' → GOOD: 'Reminder set for 9am.'
 
 LEARNING — COLLECT INFO WITHOUT BEING ANNOYING:
 You are always building a richer picture of the user's life. The goal is to know them deeply over time, but this must feel completely natural — never like a questionnaire or an interview.
@@ -1130,7 +1150,6 @@ TOOLS:
 - web_search: use for recommendations, current events, anything you can't confidently answer from memory. Always include real names, addresses, links from results — never invent URLs.
 - request_location: use when you need their location and don't have it saved. They only need to share once — you'll remember forever.
 - save_address: save any named address to permanent address book — home, work, gym, family members' places, etc. Use whenever the user mentions where someone or somewhere is. Geocodes and stores coordinates automatically.
-- book_ride: order an Uber using saved addresses. Use when user wants a ride anywhere. Resolves saved labels (e.g. "take me home" → looks up saved "home" address) and generates a pre-filled Uber deep-link. User taps once in the Uber app to confirm. Always check savedAddresses first before asking for an address.
 - set_reminder: convert any relative time to exact ISO datetime using their saved timezone. For yearly events (birthdays, anniversaries) set recurrence and is_gift_occasion.
 - book_ride: order a ride — returns Bolt + Yango always, plus Uber if available in the market (e.g. in Georgia/CIS Uber does not operate, so only Bolt + Yango are shown). Resolves saved address labels automatically. Use for any taxi/ride request.
 - order_groceries: generate Wolt and Glovo links for grocery/food delivery. Takes a list of items and the user's city. User picks items in the app.
@@ -1239,17 +1258,77 @@ async function callClaude(chatId, userText, wasVoice, username) {
           saveUserData(chatId, userData);
         } else if (block.name === 'book_ride') {
           result = await bookRide(userData, block.input);
+          if (result && result.ok) {
+            const rideButtons = [];
+            if (result.uber_link)  rideButtons.push({ text: 'Uber', url: result.uber_link });
+            if (result.bolt_link)  rideButtons.push({ text: 'Bolt', url: result.bolt_link });
+            if (result.yango_link) rideButtons.push({ text: 'Yango', url: result.yango_link });
+            await bot.sendMessage(chatId, result.dropoff, {
+              reply_markup: { inline_keyboard: [rideButtons, [{ text: 'Google Maps', url: result.maps_link }]] }
+            });
+            result = { ok: true, buttons_sent: true, dropoff: result.dropoff, market_note: result.market_note, note: 'Ride buttons sent to user as tappable Telegram buttons — DO NOT paste any URLs. Confirm verbally in one short sentence.' };
+          }
         } else if (block.name === 'order_groceries') {
           result = await orderGroceries(userData, block.input);
+          if (result && result.ok) {
+            const grocButtons = [];
+            if (result.wolt_link)  grocButtons.push({ text: 'Wolt', url: result.wolt_link });
+            if (result.glovo_link) grocButtons.push({ text: 'Glovo', url: result.glovo_link });
+            if (grocButtons.length) {
+              await bot.sendMessage(chatId, result.items_text || 'Grocery delivery', {
+                reply_markup: { inline_keyboard: [grocButtons] }
+              });
+              result = { ok: true, buttons_sent: true, note: 'Grocery buttons sent as tappable Telegram buttons — DO NOT paste URLs. One short sentence.' };
+            }
+          }
         } else if (block.name === 'search_hotels') {
           result = searchHotels(block.input);
+          if (result && result.ok) {
+            const hotelButtons = [];
+            if (result.booking_link) hotelButtons.push({ text: 'Booking.com', url: result.booking_link });
+            if (result.airbnb_link)  hotelButtons.push({ text: 'Airbnb', url: result.airbnb_link });
+            if (hotelButtons.length) {
+              const desc = [result.destination, result.check_in && result.check_out ? result.check_in + ' → ' + result.check_out : ''].filter(Boolean).join(' · ');
+              await bot.sendMessage(chatId, desc || 'Hotel options', {
+                reply_markup: { inline_keyboard: [hotelButtons] }
+              });
+              result = { ok: true, buttons_sent: true, note: 'Hotel buttons sent as tappable Telegram buttons — DO NOT paste URLs. One short sentence.' };
+            }
+          }
         } else if (block.name === 'shop_online') {
           result = shopOnline(block.input);
+          if (result && result.ok && result.links && result.links.length) {
+            const shopButtons = result.links.map(l => ({ text: l.platform.charAt(0).toUpperCase() + l.platform.slice(1), url: l.url }));
+            await bot.sendMessage(chatId, result.query || 'Shopping results', {
+              reply_markup: { inline_keyboard: [shopButtons] }
+            });
+            result = { ok: true, buttons_sent: true, note: 'Shopping buttons sent as tappable Telegram buttons — DO NOT paste URLs. One short sentence.' };
+          }
         } else if (block.name === 'search_flights') {
           result = searchFlights(block.input);
+          if (result && result.ok) {
+            const flightButtons = [];
+            if (result.google_flights) flightButtons.push({ text: 'Google Flights', url: result.google_flights });
+            if (result.skyscanner)     flightButtons.push({ text: 'Skyscanner', url: result.skyscanner });
+            if (result.kayak)          flightButtons.push({ text: 'Kayak', url: result.kayak });
+            if (flightButtons.length) {
+              const desc = [result.origin, result.destination, result.departure_date].filter(Boolean).join(' → ');
+              await bot.sendMessage(chatId, desc || 'Flight options', {
+                reply_markup: { inline_keyboard: [flightButtons] }
+              });
+              result = { ok: true, buttons_sent: true, note: 'Flight buttons sent as tappable Telegram buttons — DO NOT paste URLs. One short sentence.' };
+            }
+          }
         } else if (block.name === 'book_restaurant_online') {
           result = await bookRestaurantOnline(block.input);
           totalEventCounts.calls = (totalEventCounts.calls || 0) + 1;
+          if (result && result.ok && result.booking_url) {
+            const pName = result.platform ? result.platform.charAt(0).toUpperCase() + result.platform.slice(1) : 'Book table';
+            await bot.sendMessage(chatId, result.restaurant_name || 'Restaurant', {
+              reply_markup: { inline_keyboard: [[{ text: pName, url: result.booking_url }]] }
+            });
+            result = { ok: true, buttons_sent: true, restaurant_name: result.restaurant_name, note: 'Booking button sent as tappable Telegram button — DO NOT paste URL. One short sentence.' };
+          }
         } else if (block.name === 'make_booking_call') {
           result = await makeBookingCall(chatId, block.input);
           totalEventCounts.calls = (totalEventCounts.calls || 0) + 1;
