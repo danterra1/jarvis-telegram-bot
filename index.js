@@ -81,7 +81,7 @@ async function initDb() {
 const DATA_VERSION = 2;
 
 function emptyUserData(username, firstName) {
-  return { version: DATA_VERSION, memories: [], history: [], reminders: [], schedule: [], pendingFollowUps: [], warnedEvents: {}, username: username || '', firstName: firstName || '' };
+  return { version: DATA_VERSION, memories: [], history: [], reminders: [], schedule: [], pendingFollowUps: [], warnedEvents: {}, savedAddresses: {}, username: username || '', firstName: firstName || '' };
 }
 
 function applyBackfill(data) {
@@ -682,6 +682,7 @@ async function geocodeAddress(address) {
 
 // ---------- Save named address ----------
 async function saveAddress(userData, label, address) {
+  if (!userData.savedAddresses || typeof userData.savedAddresses !== 'object') userData.savedAddresses = {};
   const geo = await geocodeAddress(address);
   if (!geo.ok) return { error: geo.error, label, address };
 
@@ -706,6 +707,7 @@ async function saveAddress(userData, label, address) {
 
 // ---------- Book ride (Uber deep-link) ----------
 async function bookRide(userData, input) {
+  if (!userData.savedAddresses || typeof userData.savedAddresses !== 'object') userData.savedAddresses = {};
   const { dropoff_label, dropoff_address, pickup_label, pickup_address } = input;
 
   // ── Resolve dropoff ──────────────────────────────────────────────────────
