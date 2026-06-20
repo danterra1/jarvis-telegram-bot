@@ -2069,7 +2069,7 @@ bot.on('message', async (msg) => {
       const historyNote = '[User shared an image' + (caption ? ' with caption: ' + caption : '') + '. Analysis: ' + (visionResult || '').slice(0, 300) + ']';
       userData.history.push({ role: 'user', content: historyNote });
       userData.history.push({ role: 'assistant', content: visionResult || '' });
-      if (userData.history.length > MAX_HISTORY * 2) userData.history = userData.history.slice(-MAX_HISTORY * 2);
+      if (userData.history.length > 40) userData.history = userData.history.slice(-40);
       saveUserData(chatId, userData);
 
       await bot.sendMessage(chatId, visionResult || 'Got the image — could not analyse it.');
