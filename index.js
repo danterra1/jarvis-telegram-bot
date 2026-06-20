@@ -957,50 +957,38 @@ function searchFlights(input) {
 }
 
 // ---------- Online shopping (Amazon, AliExpress, Shein, eBay) ----------
-function shopOnline(input) {
-  const { query, category = 'general', budget, platforms } = input;
-  const q = encodeURIComponent(query);
-
-  // Platform URL builders
-  const urls = {
-    amazon:     'https://www.amazon.com/s?k=' + q + '&ref=jarvis',
-    aliexpress: 'https://www.aliexpress.com/wholesale?SearchText=' + q,
-    shein:      'https://www.shein.com/catalog/search.html?q=' + q,
-    ebay:       'https://www.ebay.com/sch/i.html?_nkw=' + q,
-  };
-
-  // Auto-select platforms by category if none specified
-  let selected = platforms && platforms.length ? platforms : (() => {
-    if (category === 'electronics') return ['amazon', 'aliexpress', 'ebay'];
-    if (category === 'fashion')     return ['shein', 'amazon'];
-    if (category === 'beauty')      return ['amazon', 'aliexpress'];
-    if (category === 'home')        return ['amazon', 'aliexpress', 'ebay'];
-    if (category === 'sports')      return ['amazon', 'aliexpress'];
-    if (category === 'toys')        return ['amazon', 'aliexpress'];
-    return ['amazon', 'aliexpress', 'shein', 'ebay']; // general
-  })();
-
-  const results = {};
-  const linkParts = [];
-  for (const platform of selected) {
-    if (urls[platform]) {
-      results[platform + '_link'] = urls[platform];
-      linkParts.push(platform.charAt(0).toUpperCase() + platform.slice(1) + ': ' + urls[platform]);
-    }
+async function shopOnline(input) {
+  const { query, budget } = input;
+  if (!TAVILY_KEY) return { error: 'Web search not configured.' };
+  const budgetHint = budget ? ' under ' + budget : '';
+  const searchQ = query + budgetHint + ' buy online';
+  try {
+    const resp = await fetch('https://api.tavily.com/search', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + TAVILY_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: searchQ, max_results: 10, include_answer: false }),
+    });
+    if (!resp.ok) return { error: 'Search error ' + resp.status };
+    const data = await resp.json();
+    const PRODUCT_DOMAINS = [
+      'amazon.', 'aliexpress.', 'ebay.', 'shein.', 'walmart.', 'etsy.',
+      'bestbuy.', 'target.', 'asos.', 'zalando.', 'noon.', 'namshi.',
+    ];
+    const isProductPage = url => PRODUCT_DOMAINS.some(d => url.includes(d));
+    const allResults = (data.results || []).filter(r => r.url && isWellFormedUrl(r.url));
+    const productPages = allResults.filter(r => isProductPage(r.url));
+    const picks = (productPages.length >= 3 ? productPages : allResults).slice(0, 3);
+    if (!picks.length) return { error: 'Could not find specific products for: ' + query };
+    return {
+      ok: true, query, budget: budget || null,
+      products: picks.map(r => ({
+        title: r.title.replace(/[|\-][^|\-]{0,50}$/, '').trim().slice(0, 55),
+        url: r.url,
+      })),
+    };
+  } catch (err) {
+    return { error: 'Product search failed: ' + err.message };
   }
-
-  let msg = 'Search results for "' + query + '"';
-  if (budget) msg += ' (budget: ' + budget + ')';
-  msg += ': ' + linkParts.join(' | ');
-
-  return {
-    ok: true,
-    query,
-    category,
-    platforms: selected,
-    ...results,
-    message: msg,
-  };
 }
 
 // ---------- Online restaurant booking (OpenTable / Resy deep-link) ----------
@@ -1332,7 +1320,7 @@ TOOLS:
 - order_groceries: generate Wolt and Glovo links for grocery/food delivery. Takes a list of items and the user's city. User picks items in the app.
 - search_hotels: find hotels/Airbnbs — generates pre-filled Booking.com and Airbnb search links with dates, guests, destination. Use for any hotel or accommodation request.
 - search_flights: search flights on Google Flights, Skyscanner, and Kayak. Use for any travel/flying request. Handles one-way and return. Always save the trip to memory.
-- shop_online: search Amazon, AliExpress, Shein, eBay. Use for ANY online shopping request. Auto-picks best platforms by product type (electronics -> Amazon+AliExpress, fashion -> Shein+Amazon, etc). Returns direct search links per platform. Always note the user's budget if they mention one and save it to memory.
+- shop_online: find 3 specific products to buy via live search. Use for ANY shopping request. Returns real product page links as tappable buttons — not generic search pages. Save the user's budget if mentioned.
 - book_restaurant_online: ALWAYS try this first for restaurant bookings. Use web_search to find the restaurant on OpenTable or Resy, pass the URL here, get back a one-tap booking link the user can confirm immediately. No call needed.
 - make_booking_call: FALLBACK ONLY — use only when the restaurant is not found on OpenTable or Resy. Find the phone number via web_search first. Tell the user what you're about to do before calling.
 - remember_fact / recall_memory / forget_fact: your memory tools — use constantly.
@@ -1497,13 +1485,14 @@ async function callClaude(chatId, userText, wasVoice, username) {
             }
           }
         } else if (block.name === 'shop_online') {
-          result = shopOnline(block.input);
-          if (result && result.ok && result.links && result.links.length) {
-            const shopButtons = result.links.map(l => ({ text: l.platform.charAt(0).toUpperCase() + l.platform.slice(1), url: l.url }));
-            await bot.sendMessage(chatId, result.query || 'Shopping results', {
-              reply_markup: { inline_keyboard: [shopButtons] }
+          result = await shopOnline(block.input);
+          if (result && result.ok && result.products && result.products.length) {
+            const shopButtons = result.products.map(prod => ({ text: prod.title.slice(0, 40), url: prod.url }));
+            const label = result.query + (result.budget ? ' (budget: ' + result.budget + ')' : '');
+            await bot.sendMessage(chatId, label, {
+              reply_markup: { inline_keyboard: shopButtons.map(b => [b]) }
             });
-            result = { ok: true, buttons_sent: true, note: 'Shopping buttons sent as tappable Telegram buttons — DO NOT paste URLs. One short sentence.' };
+            result = { ok: true, buttons_sent: true, count: shopButtons.length, note: 'Sent ' + shopButtons.length + ' specific product links as tappable buttons. DO NOT paste URLs. One short sentence.' };
           }
         } else if (block.name === 'search_flights') {
           result = searchFlights(block.input);
