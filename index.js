@@ -87,7 +87,7 @@ async function initDb(attempt = 1) {
 const DATA_VERSION = 2;
 
 function emptyUserData(username, firstName) {
-  return { version: DATA_VERSION, memories: [], history: [], reminders: [], schedule: [], pendingFollowUps: [], warnedEvents: {}, savedAddresses: {}, people: [], username: username || '', firstName: firstName || '' };
+  return { version: DATA_VERSION, memories: [], history: [], reminders: [], schedule: [], pendingFollowUps: [], warnedEvents: {}, savedAddresses: {}, people: [], dailyMsgDate: '', dailyMsgCount: 0, username: username || '', firstName: firstName || '' };
 }
 
 function applyBackfill(data) {
@@ -107,6 +107,8 @@ function applyBackfill(data) {
   if (typeof data.checkinSlots      === 'undefined') data.checkinSlots      = {};
   if (typeof data.savedAddresses    === 'undefined') data.savedAddresses    = {};
   if (!Array.isArray(data.people))               data.people               = [];
+  if (typeof data.dailyMsgDate  === 'undefined') data.dailyMsgDate         = '';
+  if (typeof data.dailyMsgCount === 'undefined') data.dailyMsgCount        = 0;
   data.version = DATA_VERSION;
   return data;
 }
@@ -2217,6 +2219,33 @@ bot.on('message', async (msg) => {
     return;
   }
 
+  // --- Subscription + daily rate-limit gate ---
+  {
+    const _username = msg.from?.username || '';
+    const _sub = await checkSubscription(_username);
+    if (!_sub.allowed) {
+      if (_sub.reason === 'banned') {
+        await bot.sendMessage(chatId, 'Your access to Jarvis has been revoked. Contact support if you think this is a mistake.');
+      } else if (_sub.reason === 'paused') {
+        await bot.sendMessage(chatId, 'Your subscription is paused. Reactivate it to keep chatting.');
+      }
+      return;
+    }
+    const _ud = loadUserData(chatId);
+    const _today = new Date().toISOString().slice(0, 10);
+    if (_ud.dailyMsgDate !== _today) { _ud.dailyMsgDate = _today; _ud.dailyMsgCount = 0; }
+    _ud.dailyMsgCount = (_ud.dailyMsgCount || 0) + 1;
+    saveUserData(chatId, _ud);
+    if (_ud.dailyMsgCount > _sub.limit) {
+      const _reset = new Date(); _reset.setUTCHours(24, 0, 0, 0);
+      const _hoursLeft = Math.ceil((_reset.getTime() - Date.now()) / 3600000);
+      await bot.sendMessage(chatId,
+        `You've hit your daily limit of ${_sub.limit} messages. Resets in ${_hoursLeft}h.`
+      );
+      return;
+    }
+  }
+
   bot.sendChatAction(chatId, wasVoice ? 'record_voice' : 'typing');
 
   try {
@@ -2847,6 +2876,28 @@ const webhookServer = http.createServer((req, res) => {
   res.end();
 });
 
+
+const SUBSCRIPTION_API = 'https://c79b1d1c-b690-42a4-89c1-7aa003a55a66-00-3gtw2r50e421s.pike.replit.dev';
+const DEFAULT_MSG_LIMIT = 15;
+
+async function checkSubscription(username) {
+  if (!username) return { allowed: true, limit: DEFAULT_MSG_LIMIT, status: 'unknown' };
+  try {
+    const clean = username.replace(/^@/, '').toLowerCase().trim();
+    const r = await fetch(
+      SUBSCRIPTION_API + '/api/verify/subscription?telegram_username=' + encodeURIComponent(clean),
+      { signal: AbortSignal.timeout(3000) }
+    );
+    if (!r.ok) return { allowed: true, limit: DEFAULT_MSG_LIMIT, status: 'unknown' };
+    const data = await r.json();
+    if (data.status === 'banned') return { allowed: false, reason: 'banned', limit: 0, status: 'banned' };
+    if (data.status === 'paused') return { allowed: false, reason: 'paused', limit: 0, status: 'paused' };
+    const limit = data.messageLimitPerDay || DEFAULT_MSG_LIMIT;
+    return { allowed: true, limit, status: data.status || 'free' };
+  } catch (_) {
+    return { allowed: true, limit: DEFAULT_MSG_LIMIT, status: 'unknown' };
+  }
+}
 
 async function registerWithJarvis(username, firstName) {
   try {
