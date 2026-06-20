@@ -145,7 +145,7 @@ async function loadUserDataAsync(chatId) {
   if (userDataCache[key]) return userDataCache[key];
   if (pool) {
     try {
-      const res = await pool.query('SELECT data FROM user_data WHERE chat_id = ', [key]);
+      const res = await pool.query('SELECT data FROM user_data WHERE chat_id = $1', [key]);
       if (res.rows.length) {
         const d = typeof res.rows[0].data === 'string' ? JSON.parse(res.rows[0].data) : res.rows[0].data;
         userDataCache[key] = applyBackfill(d);
@@ -2337,6 +2337,14 @@ bot.on('message', async (msg) => {
 
 bot.on('polling_error', (err) => {
   console.error('Polling error:', err.message);
+});
+
+// Prevent any single unhandled promise from killing the process
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection (caught — bot stays alive):', reason?.message || reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception (caught — bot stays alive):', err.message);
 });
 
 // ---------- Reminder scheduler ----------
