@@ -286,7 +286,6 @@ const tools = [
           description: 'Optional: restrict the search to one category.',
         },
       },
-      required: [],
     },
   },
   {
@@ -348,7 +347,6 @@ const tools = [
         pickup_label: { type: 'string', description: 'Label of saved pickup address. Omit to use current GPS.' },
         pickup_address: { type: 'string', description: 'Full pickup address if not using current location.' },
       },
-      required: [],
     },
   },
   {
@@ -547,7 +545,6 @@ const tools = [
         location: { type: 'string', description: 'New location' },
         notes: { type: 'string', description: 'New or additional notes' },
       },
-      required: [],
     },
   },
   {
@@ -560,7 +557,6 @@ const tools = [
         title_keyword: { type: 'string', description: 'Keyword to find the event by title if ID unknown' },
         date: { type: 'string', description: 'Date to narrow down the search YYYY-MM-DD. Optional.' },
       },
-      required: [],
     },
   },
   {
@@ -1614,7 +1610,7 @@ function localDateStr(userData) {
 }
 
 function addEvent(userData, input) {
-  if (!Array.isArray(userData.schedule)) userData.schedule = {};
+  if (!Array.isArray(userData.schedule)) userData.schedule = [];
   if (!Array.isArray(userData.schedule)) userData.schedule = [];
   const ev = {
     id: 'evt_' + Date.now(),
