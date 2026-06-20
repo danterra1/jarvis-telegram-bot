@@ -39,7 +39,7 @@ const userDataCache = {};
 
 // Keep DATA_DIR for active_calls.json (ephemeral call state only)
 const DATA_DIR = path.join(process.cwd(), 'data');
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
+try { if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR); } catch(_) {}
 
 let pool = null;
 if (process.env.DATABASE_URL) {
@@ -62,8 +62,8 @@ async function dbUpsert(chatId, data) {
   catch (err) { console.error('DB upsert failed for', chatId, err.message); }
 }
 
-async function initDb() {
-  if (!pool) { console.warn('No DATABASE_URL — starting with empty in-memory state.'); return; }
+async function initDb(attempt = 1) {
+  if (!pool) { console.warn('No DATABASE_URL — data will reset on restart.'); return; }
   try {
     await pool.query(SQL_CREATE_TABLE);
     const res = await pool.query(SQL_SELECT_ALL);
@@ -73,7 +73,13 @@ async function initDb() {
     }
     console.log('DB ready. Loaded', res.rows.length, 'users into cache.');
   } catch (err) {
-    console.error('initDb error:', err.message);
+    console.error('initDb error (attempt ' + attempt + '):', err.message);
+    if (attempt < 3) {
+      console.log('Retrying DB init in 4 seconds...');
+      await new Promise(r => setTimeout(r, 4000));
+      return initDb(attempt + 1);
+    }
+    console.warn('DB unavailable after retries — per-request fallback active.');
   }
 }
 
@@ -129,9 +135,36 @@ function loadUserData(chatId) {
   return fresh;
 }
 
+// Async version: checks Postgres on cache miss so restarts do not lose data
+async function loadUserDataAsync(chatId) {
+  const key = String(chatId);
+  if (userDataCache[key]) return userDataCache[key];
+  if (pool) {
+    try {
+      const res = await pool.query('SELECT data FROM user_data WHERE chat_id = ', [key]);
+      if (res.rows.length) {
+        const d = typeof res.rows[0].data === 'string' ? JSON.parse(res.rows[0].data) : res.rows[0].data;
+        userDataCache[key] = applyBackfill(d);
+        return userDataCache[key];
+      }
+    } catch (err) {
+      console.error('loadUserDataAsync DB read failed:', err.message);
+    }
+  }
+  const fresh = emptyUserData();
+  userDataCache[key] = fresh;
+  return fresh;
+}
+
 // Call sanitizeHistory on every data load to fix corrupted histories in DB
 function loadAndSanitize(chatId) {
   const d = loadUserData(chatId);
+  d.history = sanitizeHistory(d.history);
+  return d;
+}
+
+async function loadAndSanitizeAsync(chatId) {
+  const d = await loadUserDataAsync(chatId);
   d.history = sanitizeHistory(d.history);
   return d;
 }
@@ -1369,7 +1402,7 @@ ${locationLine}`;
 
 // ---------- Core Claude call with tool loop ----------
 async function callClaude(chatId, userText, wasVoice, username) {
-  const userData = loadAndSanitize(chatId);
+  const userData = await loadAndSanitizeAsync(chatId);
   // Always keep the stored identity up-to-date
   if (username && !userData.username) { userData.username = username; saveUserData(chatId, userData); }
   userData.history.push({ role: 'user', content: userText });
