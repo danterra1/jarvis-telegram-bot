@@ -452,7 +452,7 @@ async function makeBookingCall(chatId, args) {
           firstMessage: `Hi, I'm calling to book a table for ${args.party_size}, for ${args.date_time_description}.`,
           model: {
             provider: 'anthropic',
-            model: 'claude-sonnet-4-6',
+            model: 'claude-haiku-3-5-20241022',
             messages: [{ role: 'system', content: systemPrompt }],
           },
           voice: { provider: 'playht', voiceId: 'jennifer' },
@@ -531,6 +531,45 @@ async function reverseGeocode(lat, lon) {
 // once the person has hundreds of memories.
 const INLINE_MEMORY_LIMIT = 25;
 
+
+// Returns system as array of content blocks with Anthropic prompt caching.
+// The large static base is marked ephemeral (cached ~1hr), saving ~60-80% on
+// input tokens since the base is ~1500 tokens reused on every message.
+function buildSystemBase(nowIso) {
+  return 'You are Jarvis, a sharp, witty personal AI assistant talking to your owner over Telegram, like texting a close friend who is good with tech. Not formal, not robotic, no as an AI disclaimers. Keep responses conversational and reasonably short unless they ask for real detail. The current UTC date/time is ' + nowIso + ' — use this as now when the user gives a relative time (e.g. in 20 minutes, tomorrow at 9am). You have a durable long-term memory store for this user, saved to disk, that persists across all conversations. Use remember_fact proactively whenever the user mentions something worth keeping track of (dates, work deadlines, plans, people, preferences, locations). Use forget_fact when something they told you is no longer true, and remember_fact again with corrected info if updating. Below you will see a list of recent memories already loaded for convenience, but that list is NOT your full memory. If asked about something not in that list, call recall_memory first to search the full store. You also have web_search — use it whenever the user asks for recommendations, current events, or anything you are not confidently sure of. Include actual names, addresses, and links for anything the user would want to visit or click on. Never invent URLs. If a search result url is null, skip the link. If location-dependent and no saved location, use request_location. Use set_reminder whenever asked to be reminded about something — convert relative times to ISO datetime using the current time. For birthdays and anniversaries set recurrence yearly and is_gift_occasion true. You also have make_booking_call — use it when the user asks you to call and book a restaurant on their behalf. Find the phone number via web_search first. Tell the user what you are about to do before calling. Treat every conversation as a chance to learn more about the owner and give sharper personalized help.';
+}
+
+function buildSystemBlocks(userData) {
+  const nowIso = new Date().toISOString();
+  const base = buildSystemBase(nowIso);
+  let dynamic = '';
+  if (userData.memories && userData.memories.length) {
+    const sorted = [...userData.memories].sort((a, b) => (b.updatedAt || b.date).localeCompare(a.updatedAt || a.date));
+    const shown = sorted.slice(0, INLINE_MEMORY_LIMIT);
+    const omittedCount = userData.memories.length - shown.length;
+    const memLines = shown.map((m) => '- [' + m.category + '] ' + m.text + ' (id: ' + m.id + ', saved ' + m.date + (m.updatedAt && m.updatedAt !== m.date ? ', updated ' + m.updatedAt : '') + ')').join('
+');
+    dynamic += '
+
+Quick-access memory (' + shown.length + ' of ' + userData.memories.length + ' total memories — most recently updated first):
+' + memLines;
+    if (omittedCount > 0) dynamic += '
+
+...and ' + omittedCount + ' more memories not shown here. Use recall_memory to search them if relevant.';
+  }
+  if (userData.reminders && userData.reminders.length) {
+    const remLines = userData.reminders.map((r) => '-  + r.text +  scheduled for ' + r.when + (r.recurrence && r.recurrence !== 'none' ? ' (repeats ' + r.recurrence + ')' : '')).join('
+');
+    dynamic += '
+
+Upcoming reminders already scheduled for this user:
+' + remLines;
+  }
+  const blocks = [{ type: 'text', text: base, cache_control: { type: 'ephemeral' } }];
+  if (dynamic) blocks.push({ type: 'text', text: dynamic });
+  return blocks;
+}
+
 function buildSystemPrompt(userData) {
   const nowIso = new Date().toISOString();
   const base = `You are Jarvis, a sharp, witty personal AI assistant talking to your owner over Telegram, like texting a close friend who's good with tech. Not formal, not robotic, no "as an AI" disclaimers. Keep responses conversational and reasonably short unless they ask for real detail. The current UTC date/time is ${nowIso} — use this as "now" when the user gives a relative time (e.g. "in 20 minutes", "tomorrow at 9am"). 
@@ -574,7 +613,7 @@ async function callClaude(chatId, userText, wasVoice, username) {
   userData.history.push({ role: 'user', content: userText });
 
   // Keep history bounded so requests don't grow unbounded
-  const MAX_HISTORY = 40;
+  const MAX_HISTORY = 20;
   if (userData.history.length > MAX_HISTORY) {
     userData.history = userData.history.slice(-MAX_HISTORY);
   }
@@ -590,12 +629,16 @@ async function callClaude(chatId, userText, wasVoice, username) {
   let totalEventCounts = {};
 
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
+    const systemBlocks = buildSystemBlocks(userData);
+    const cachedTools = tools.map((t, i) =>
+      i === tools.length - 1 ? { ...t, cache_control: { type: 'ephemeral' } } : t
+    );
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: 'claude-haiku-3-5-20241022',
       max_tokens: 1024,
-      system: buildSystemPrompt(userData),
+      system: systemBlocks,
       messages: userData.history,
-      tools,
+      tools: cachedTools,
     });
 
     totalAnthropicTokens += (response.usage?.input_tokens || 0) + (response.usage?.output_tokens || 0);
