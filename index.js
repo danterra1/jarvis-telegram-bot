@@ -103,12 +103,37 @@ function applyBackfill(data) {
   return data;
 }
 
+function sanitizeHistory(history) {
+  if (!Array.isArray(history)) return [];
+  const clean = [];
+  for (let _h = 0; _h < history.length; _h++) {
+    const msg = history[_h];
+    // Drop assistant messages with tool_use if next message is not tool_result
+    if (msg.role === 'assistant' && Array.isArray(msg.content) &&
+        msg.content.some(b => b && b.type === 'tool_use')) {
+      const next = history[_h + 1];
+      const hasResult = next && next.role === 'user' && Array.isArray(next.content) &&
+                        next.content.some(b => b && b.type === 'tool_result');
+      if (!hasResult) { _h++; continue; } // skip orphaned pair
+    }
+    clean.push(msg);
+  }
+  return clean;
+}
+
 function loadUserData(chatId) {
   const key = String(chatId);
   if (userDataCache[key]) return userDataCache[key];
   const fresh = emptyUserData();
   userDataCache[key] = fresh;
   return fresh;
+}
+
+// Call sanitizeHistory on every data load to fix corrupted histories in DB
+function loadAndSanitize(chatId) {
+  const d = loadUserData(chatId);
+  d.history = sanitizeHistory(d.history);
+  return d;
 }
 
 // Atomic-ish write: write to a temp file then rename, so a crash mid-write
@@ -1353,7 +1378,7 @@ ${locationLine}`;
 
 // ---------- Core Claude call with tool loop ----------
 async function callClaude(chatId, userText, wasVoice, username) {
-  const userData = loadUserData(chatId);
+  const userData = loadAndSanitize(chatId);
   // Always keep the stored identity up-to-date
   if (username && !userData.username) { userData.username = username; saveUserData(chatId, userData); }
   userData.history.push({ role: 'user', content: userText });
@@ -1361,7 +1386,18 @@ async function callClaude(chatId, userText, wasVoice, username) {
   // Keep history bounded so requests don't grow unbounded
   const MAX_HISTORY = 20;
   if (userData.history.length > MAX_HISTORY) {
-    userData.history = userData.history.slice(-MAX_HISTORY);
+    // Safe truncation: never cut inside a tool_use/tool_result pair.
+    // Anthropic 400s if an assistant tool_use has no matching tool_result.
+    const sliced = userData.history.slice(-MAX_HISTORY);
+    // Walk forward until we find a plain user text message (safe start point)
+    let safeStart = 0;
+    for (let _k = 0; _k < sliced.length; _k++) {
+      if (sliced[_k].role === 'user' && typeof sliced[_k].content === 'string') {
+        safeStart = _k;
+        break;
+      }
+    }
+    userData.history = sliced.slice(safeStart);
   }
 
   const MAX_TOOL_ITERATIONS = 5;
