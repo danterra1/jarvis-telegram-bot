@@ -62,6 +62,7 @@ function loadUserData(chatId) {
       if (typeof data.warnedReminders === 'undefined') data.warnedReminders = {};
       if (typeof data.locationUtcOffset === 'undefined') data.locationUtcOffset = 0;
       if (typeof data.locationTimezone === 'undefined') data.locationTimezone = 'UTC';
+      if (typeof data.lastWeeklyReview === 'undefined') data.lastWeeklyReview = '';
       if (!Array.isArray(data.history)) data.history = [];
       if (!Array.isArray(data.reminders)) data.reminders = [];
       data.version = DATA_VERSION;
@@ -242,8 +243,8 @@ const tools = [
         text: { type: 'string', description: 'The fact to remember, written plainly.' },
         category: {
           type: 'string',
-          enum: ['date', 'work', 'party', 'person', 'preference', 'location', 'other'],
-          description: 'One of: date, work, party, person, preference, location, other',
+          enum: ['date', 'work', 'person', 'preference', 'location', 'health', 'finance', 'habit', 'goal', 'project', 'relationship', 'other'],
+          description: 'One of: date (important dates/deadlines), work (job tasks/meetings), person (people in their life), preference (likes/dislikes/style), location (places), health (medical/fitness/diet), finance (money/budget/expenses), habit (routines/recurring behaviors), goal (aspirations/targets), project (ongoing work/personal projects), relationship (family/friends/romantic), other',
         },
       },
       required: ['text', 'category'],
@@ -259,7 +260,7 @@ const tools = [
         query: { type: 'string', description: 'Keyword or phrase to search for. Leave empty to browse by category instead.' },
         category: {
           type: 'string',
-          enum: ['date', 'work', 'party', 'person', 'preference', 'location', 'other'],
+          enum: ['date', 'work', 'person', 'preference', 'location', 'health', 'finance', 'habit', 'goal', 'project', 'relationship', 'other'],
           description: 'Optional: restrict the search to one category.',
         },
       },
@@ -555,11 +556,43 @@ function buildSystemPrompt(userData) {
   const locationLine = userData.locationPlace
     ? `\n\nThe user is based in ${userData.locationPlace} (${userData.locationTimezone || 'UTC'}). Always use this for timezone, weather, and location-based queries unless they share a different location.`
     : '';
-  const base = `You are Jarvis, a sharp, witty personal AI assistant talking to your owner over Telegram, like texting a close friend who's good with tech. Not formal, not robotic, no "as an AI" disclaimers. Keep responses conversational and reasonably short unless they ask for real detail. The current UTC date/time is ${nowIso} — use this as "now" when the user gives a relative time (e.g. "in 20 minutes", "tomorrow at 9am"). 
+  const base = `You are Jarvis — not just an assistant, but the user's personal chief of staff and life manager, available over Telegram. You think like a combination of a brilliant personal assistant, a trusted advisor, and a sharp friend who happens to know everything about them. The current UTC date/time is ${nowIso}.
 
-You have a durable long-term memory store for this user, saved to disk, that persists across all conversations. Use remember_fact proactively whenever the user mentions something worth keeping track of (dates, work deadlines, plans, people, preferences, locations) — don't wait to be asked. Use forget_fact when something they told you is no longer true, and remember_fact again with corrected info if they're updating rather than removing a fact. Below you'll see a list of recent/frequent memories already loaded for convenience, but that list is NOT your full memory — it's just a quick-access subset. If you're asked about something not in that list, if you're unsure whether you already know something, or if you ever catch yourself about to say "I don't know that about you," call recall_memory first to actively search the full store before answering — don't assume something was never saved just because it isn't sitting in front of you right now. This matters: the user is relying on you to actually have persistent memory, not to fake it from a short list.
+CORE ROLE — LIFE MANAGEMENT:
+You actively manage the user's life, not just respond to requests. This means:
+- You track their work, projects, health, finances, habits, goals, and relationships across all conversations.
+- You notice patterns: if they mention being tired often, you ask about sleep. If a project deadline is approaching you haven't heard about, you flag it. If they said they'd call someone last week and you have no follow-up, you check in.
+- You proactively connect dots: "You mentioned the client meeting is Thursday — want me to set a reminder for Wednesday evening to prep?"
+- You get smarter with every interaction. Build a rich, detailed model of who they are: their priorities, their schedule patterns, their relationships, their goals, how they like to work, what stresses them, what they're working toward.
+- Every conversation is data. A casual mention of a flight, a new project, a person's name — save it. You are building a living picture of their life.
 
-You also have web_search — use it whenever the user asks for recommendations, current events, or anything you're not confidently sure of. When you get search results back, describe what you found in your own words, but DO include the actual name, address/link, and key details for anything the user would want to visit, click, or act on (restaurants, businesses, articles, products) — don't strip out useful URLs or names just to paraphrase, the user needs that information to actually use it. Each search result's "url" field will be null if no reliable link was found for that result — if a result has a null url, mention the name/snippet but do NOT invent, guess, or fabricate a URL for it; just skip the link for that one item. Never present a link you are not certain came directly from the search results. If the user asks for something location-dependent (nearby restaurants, local weather, directions) and you don't already have a saved location for them in memory, use request_location to ask them to share it — then wait for them to tap the button before searching. Use set_reminder whenever the user asks to be reminded or pinged about something at a future time — convert their relative time into an exact ISO datetime using the current time above, and account for their saved location's timezone if you can infer it. Be a genuinely proactive personal assistant: when a request is ambiguous or underspecified, ask a short clarifying question instead of guessing — e.g. if asked to "remind me about birthdays" without specifics, ask whose birthday, what date, and whether it repeats every year. For birthdays, anniversaries, or other yearly occasions, set recurrence to "yearly" and set is_gift_occasion to true so you can proactively suggest gift ideas when the reminder fires. You also have make_booking_call — use it when the user asks you to call and book a restaurant reservation on their behalf. Find the business's phone number via web_search if you don't already have it; never invent a phone number, ask the user for it if search doesn't find a reliable one. Before calling this tool, tell the user in your reply exactly what you're about to do (who you're calling, party size, and time) since the call happens immediately. The result of the call is reported back separately once it finishes, not in this turn. Treat every conversation as a chance to learn more about the owner — their relationships, preferences, routines — and use that to give sharper, more personalized help over time.${locationLine}`;
+MEMORY — USE IT AGGRESSIVELY:
+You have a durable long-term memory store (saved to disk, persists forever). Categories: date, work, person, preference, location, health, finance, habit, goal, project, relationship, other.
+- Save everything worth knowing — unprompted. Don't wait to be asked. If they mention a deadline, save it. If they mention their sister's name, save it. If they mention they hate mornings, save it.
+- When something changes, use forget_fact and re-save with the update. Keep the store accurate.
+- Before answering anything about them, call recall_memory if you're not sure you have everything — your visible list is just a fast-access subset, not the full store.
+- Group and organize: use the right category. Project details go in [project], health updates in [health], financial goals in [finance], recurring behaviors in [habit].
+
+PROACTIVE MANAGEMENT:
+- If you notice a gap (a deadline without a reminder, a goal without a plan, a project that hasn't been mentioned in a while), bring it up naturally.
+- When they complete something, celebrate briefly and update the memory.
+- If they're stressed or overwhelmed, offer to help organize and prioritize — don't just answer the surface question.
+- Spot conflicts: if they have two things at the same time, flag it.
+
+COMMUNICATION STYLE:
+- Telegram texting style: concise, warm, direct. Like a smart friend who also happens to be incredibly organized.
+- No bullet-point walls unless they ask for a structured list. Conversational flowing text.
+- No "as an AI" disclaimers. No robotic language. Just sharp, helpful, human-feeling.
+- Short replies for simple things. Detailed only when they actually need detail.
+
+TOOLS:
+- web_search: use for recommendations, current events, anything you can't confidently answer from memory. Always include real names, addresses, links from results — never invent URLs.
+- request_location: use when you need their location and don't have it saved. They only need to share once — you'll remember forever.
+- set_reminder: convert any relative time to exact ISO datetime using their saved timezone. For yearly events (birthdays, anniversaries) set recurrence and is_gift_occasion.
+- make_booking_call: call restaurants on their behalf. Find the number via web_search first. Tell them what you're about to do before calling.
+- remember_fact / recall_memory / forget_fact: your memory tools — use constantly.
+
+${locationLine}`;
 
   if (!userData.memories.length) return base;
 
@@ -1130,16 +1163,29 @@ async function sendMorningBriefings() {
       weekday: 'long', month: 'long', day: 'numeric',
     });
 
-    const briefingPrompt = 'Today is ' + dayLabel + '. Write a short friendly morning briefing for the user in 3-5 sentences. ' +
-      'Cover what is coming up today and this week, and flag anything time-sensitive from their memories (deadlines, tasks, plans). ' +
-      'Tone: like texting a smart friend good morning. No bullet lists, flowing text. No "as an AI" language.\n\n' +
-      'UPCOMING REMINDERS:\n' + (upcoming || 'None in the next 7 days.') + '\n\n' +
-      'USER MEMORIES:\n' + (recentMemories || 'None saved yet.');
+    // Organize memories by category for smarter briefing
+    const memByCategory = {};
+    for (const m of (userData.memories || [])) {
+      const cat = m.category || 'other';
+      if (!memByCategory[cat]) memByCategory[cat] = [];
+      memByCategory[cat].push(m.text);
+    }
+    const categorySummary = Object.entries(memByCategory)
+      .map(([cat, items]) => '[' + cat + ']\n' + items.slice(0, 5).map(t => '  - ' + t).join('\n'))
+      .join('\n');
+
+    const briefingPrompt = 'Today is ' + dayLabel + '. You are Jarvis, the user\'s personal life manager. ' +
+      'Write a smart, personalized morning briefing in 4-7 sentences. ' +
+      'Cover: (1) what\'s happening today and this week from reminders, (2) anything time-sensitive from their work/projects/goals, ' +
+      '(3) one proactive nudge — something they should do today based on their life context (a habit they track, a goal they\'re working toward, a person they should follow up with, etc). ' +
+      'Tone: like a sharp, caring chief of staff texting them good morning. Flowing text, no bullet lists. No "as an AI" language.\n\n' +
+      'UPCOMING REMINDERS (next 7 days):\n' + (upcoming || 'None scheduled.') + '\n\n' +
+      'THEIR LIFE CONTEXT (by category):\n' + (categorySummary || 'Still learning about them — first briefing.');
 
     try {
       const resp = await anthropic.messages.create({
         model: 'claude-sonnet-4-6',
-        max_tokens: 250,
+        max_tokens: 400,
         messages: [{ role: 'user', content: briefingPrompt }],
       });
       const text = resp.content.find((b) => b.type === 'text')?.text;
@@ -1150,9 +1196,86 @@ async function sendMorningBriefings() {
   }
 }
 
+
+// ─── Proactive: weekly Sunday life review ────────────────────────────────────
+// Every Sunday between 19:00-19:14 local time, Claude reviews all the user's
+// memories and sends a weekly summary + questions to learn more about them.
+async function sendWeeklyReview() {
+  let files;
+  try {
+    files = fs.readdirSync(DATA_DIR).filter(
+      (f) => f.startsWith('user_') && f.endsWith('.json') && !f.includes('.corrupt-') && !f.endsWith('.tmp')
+    );
+  } catch (_) { return; }
+
+  for (const file of files) {
+    const chatId = file.slice('user_'.length, -'.json'.length);
+    let userData;
+    try {
+      userData = JSON.parse(fs.readFileSync(path.join(DATA_DIR, file), 'utf8'));
+    } catch (_) { continue; }
+
+    const hasContent = (userData.memories && userData.memories.length > 2);
+    if (!hasContent) continue;
+
+    const utcOffsetHrs = userData.locationUtcOffset || 0;
+    const nowUtc = new Date();
+    const localMs = nowUtc.getTime() + utcOffsetHrs * 3600000;
+    const localDate = new Date(localMs);
+
+    // Only on Sundays (0 = Sunday), between 19:00 and 19:14 local
+    if (localDate.getUTCDay() !== 0) continue;
+    if (localDate.getUTCHours() !== 19 || localDate.getUTCMinutes() >= 15) continue;
+
+    // Only once per week
+    const weekStr = localDate.toISOString().slice(0, 10); // use date as key
+    if (userData.lastWeeklyReview === weekStr) continue;
+
+    userData.lastWeeklyReview = weekStr;
+    saveUserData(chatId, userData);
+
+    // Build full memory picture
+    const allMemories = (userData.memories || [])
+      .sort((a, b) => (b.updatedAt || b.date).localeCompare(a.updatedAt || a.date))
+      .map((m) => '[' + m.category + '] ' + m.text)
+      .join('
+');
+
+    const upcomingReminders = (userData.reminders || [])
+      .filter(r => new Date(r.when).getTime() > localMs)
+      .sort((a, b) => new Date(a.when) - new Date(b.when))
+      .slice(0, 10)
+      .map(r => '- ' + r.text + ' (' + new Date(r.when).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }) + ')')
+      .join('
+');
+
+    const reviewPrompt = 'You are Jarvis, the user\'s personal life manager. It\'s Sunday evening — time for a brief weekly review. ' +
+      'Based on everything you know about them below, write a thoughtful weekly wrap-up message in 5-8 sentences. ' +
+      'Cover: (1) a quick reflection on what they likely accomplished or dealt with this week based on their context, ' +
+      '(2) what\'s coming up next week that they should be aware of, ' +
+      '(3) one thing you\'d like to learn more about to help them better — ask it as a natural question, not a form. ' +
+      'Tone: like a trusted advisor checking in Sunday evening. Warm but sharp. No bullet lists.\n\n' +
+      'EVERYTHING I KNOW ABOUT THEM:\n' + (allMemories || 'Very little yet.') + '\n\n' +
+      'UPCOMING REMINDERS:\n' + (upcomingReminders || 'Nothing scheduled.');
+
+    try {
+      const resp = await anthropic.messages.create({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 450,
+        messages: [{ role: 'user', content: reviewPrompt }],
+      });
+      const text = resp.content.find((b) => b.type === 'text')?.text;
+      if (text) await bot.sendMessage(chatId, text);
+    } catch (err) {
+      console.error('[weekly-review] chatId', chatId, err.message);
+    }
+  }
+}
+
 setInterval(checkReminders, 60 * 1000);
 setInterval(checkUpcomingDeadlines, 60 * 60 * 1000); // hourly: 3-day and 1-day warnings
 setInterval(sendMorningBriefings, 15 * 60 * 1000);   // every 15 min: 8 AM local briefing
+setInterval(sendWeeklyReview, 15 * 60 * 1000);        // every 15 min: Sunday 7 PM life review
 
 // ---------- Webhook server (Vapi call outcomes) ----------
 // Vapi posts here when an outbound booking call finishes. We look up which
