@@ -65,6 +65,7 @@ function loadUserData(chatId) {
       if (typeof data.lastWeeklyReview === 'undefined') data.lastWeeklyReview = '';
       if (typeof data.checkinSlots === 'undefined') data.checkinSlots = {};
       if (typeof data.savedAddresses === 'undefined') data.savedAddresses = {};
+      if (!Array.isArray(data.pendingFollowUps)) data.pendingFollowUps = [];
       if (!Array.isArray(data.history)) data.history = [];
       if (!Array.isArray(data.reminders)) data.reminders = [];
       data.version = DATA_VERSION;
@@ -445,6 +446,41 @@ const tools = [
         special_requests: { type: 'string', description: 'Any special requests, e.g. "window seat", "highchair needed", dietary notes. Optional.' },
       },
       required: ['business_name', 'phone_number', 'party_size', 'date_time_description', 'reservation_name'],
+    },
+  },
+  {
+    name: 'fetch_url',
+    description: 'Fetch and read the full text content of any URL the user shares or mentions. ALWAYS call this when a URL appears — never guess the content. Extract what matters, save key facts to memory. Receipts → [finance]. Contacts → [person]. Articles → summarise and save key points.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'Full URL including https://' },
+        focus: { type: 'string', description: 'What to extract: summary, prices, contacts, dates, action_items, or general' },
+      },
+      required: ['url'],
+    },
+  },
+  {
+    name: 'track_followup',
+    description: 'Save a pending follow-up item the user said they need to act on later. Use when user says things like: I need to call X, I will email Y tomorrow, I should check on Z. Jarvis will surface overdue ones proactively.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'What needs to be followed up on, in plain language' },
+        due_hours: { type: 'number', description: 'Hours until due: 24=tomorrow, 48=2 days, 168=week. Default 48.' },
+      },
+      required: ['text'],
+    },
+  },
+  {
+    name: 'resolve_followup',
+    description: 'Mark a follow-up as done. Use when user says they completed something that was being tracked.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'Keyword matching the follow-up to resolve' },
+      },
+      required: ['text'],
     },
   },
 ];
@@ -1164,6 +1200,9 @@ TOOLS:
 - make_booking_call: FALLBACK ONLY — use only when the restaurant is not found on OpenTable or Resy. Find the phone number via web_search first. Tell the user what you're about to do before calling.
 - remember_fact / recall_memory / forget_fact: your memory tools — use constantly.
 - Images/photos: when the user sends a photo (receipt, screenshot, menu, document, business card, anything), you receive it with full vision. Extract all useful information and save key facts to memory immediately. Receipts → save amounts/vendors to [finance]. Business cards → save contact to [person]. Menus → answer questions about them. Documents → summarise and extract action items.
+- fetch_url: ALWAYS call this when any URL appears in the conversation. Never guess or paraphrase a URL you have not read. Fetch it, extract what matters, save key facts to memory.
+- track_followup: use whenever user says they will do something or need to follow up on something. Examples: 'I need to call the dentist', 'I will email John tomorrow', 'I should follow up on the proposal'. Save every one.
+- resolve_followup: when user says they completed something tracked as a follow-up, find and mark it resolved.
 
 ${locationLine}`;
 
@@ -1334,6 +1373,17 @@ async function callClaude(chatId, userText, wasVoice, username) {
             });
             result = { ok: true, buttons_sent: true, restaurant_name: result.restaurant_name, note: 'Booking button sent as tappable Telegram button — DO NOT paste URL. One short sentence.' };
           }
+        } else if (block.name === 'fetch_url') {
+          result = await fetchUrl(block.input.url, block.input.focus);
+        } else if (block.name === 'track_followup') {
+          result = trackFollowup(userData, block.input.text, block.input.due_hours);
+          saveUserData(chatId, userData);
+        } else if (block.name === 'resolve_followup') {
+          if (!Array.isArray(userData.pendingFollowUps)) userData.pendingFollowUps = [];
+          const kw = (block.input.text || '').toLowerCase();
+          const hit = userData.pendingFollowUps.find(f => !f.resolved && f.text.toLowerCase().includes(kw));
+          if (hit) { hit.resolved = true; hit.resolvedDate = new Date().toISOString(); saveUserData(chatId, userData); result = { ok: true, resolved: hit.text }; }
+          else { result = { error: 'No matching follow-up for: ' + block.input.text }; }
         } else if (block.name === 'make_booking_call') {
           result = await makeBookingCall(chatId, block.input);
           totalEventCounts.calls = (totalEventCounts.calls || 0) + 1;
@@ -1426,6 +1476,38 @@ async function synthesizeSpeech(text) {
   } catch (err) {
     return { error: 'Speech synthesis failed: ' + err.message };
   }
+}
+
+// ---------- Fetch text content from a URL ----------
+async function fetchUrl(url, focus) {
+  try {
+    const r = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Jarvis/1.0)', Accept: 'text/html,*/*' },
+      signal: AbortSignal.timeout(12000),
+    });
+    if (!r.ok) return { error: 'HTTP ' + r.status + ': ' + r.statusText };
+    const html = await r.text();
+    const clean = html
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[\s\S]*?<\/style>/gi, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+      .replace(/\s+/g, ' ').trim();
+    return { ok: true, url, content: clean.slice(0, 7000), total_chars: clean.length, focus: focus || 'general' };
+  } catch (err) {
+    return { error: 'Could not fetch: ' + err.message };
+  }
+}
+
+// ---------- Track a follow-up ----------
+function trackFollowup(userData, text, dueHours) {
+  if (!Array.isArray(userData.pendingFollowUps)) userData.pendingFollowUps = [];
+  const h = dueHours || 48;
+  const dueDate = new Date(Date.now() + h * 3600000).toISOString();
+  userData.pendingFollowUps.push({ id: Date.now().toString(), text, addedDate: new Date().toISOString(), dueDate, resolved: false });
+  return { ok: true, text, dueDate, note: 'Follow-up tracked. Will surface if unresolved by ' + dueDate.slice(0, 10) };
 }
 
 // ---------- Send a reply, respecting voice-in/voice-out, with a text
@@ -1705,7 +1787,7 @@ bot.on('message', async (msg) => {
       '',
       'Upcoming reminders:\n' + remindersLine,
       '',
-      'Commands: /me  /memories  /forget_everything',
+      'Commands: /me  /memories  /spending  /followups  /forget_everything',
     ];
     bot.sendMessage(chatId, lines.join('\n'));
     return;
@@ -1728,10 +1810,37 @@ bot.on('message', async (msg) => {
     return;
   }
 
+  if (text === '/spending') {
+    const sd = loadUserData(chatId);
+    const fMems = (sd.memories || []).filter(m => m.category === 'finance');
+    if (!fMems.length) { bot.sendMessage(chatId, 'No spending tracked yet. Tell me about purchases and I save them automatically.'); return; }
+    const spendLines = ['Finance notes (' + fMems.length + ' total):', ''];
+    fMems.slice(-20).forEach(m => spendLines.push('• ' + m.text));
+    bot.sendMessage(chatId, spendLines.join('\n'));
+    return;
+  }
+
+  if (text === '/followups') {
+    const fd = loadUserData(chatId);
+    const active = (fd.pendingFollowUps || []).filter(f => !f.resolved);
+    if (!active.length) { bot.sendMessage(chatId, 'No pending follow-ups. I track them when you say things like "I need to call X" or "I will email John".'); return; }
+    const nowT = Date.now();
+    const over2 = active.filter(f => new Date(f.dueDate).getTime() < nowT);
+    const pend2 = active.filter(f => new Date(f.dueDate).getTime() >= nowT);
+    const fout = ['Pending follow-ups:', ''];
+    if (over2.length) { fout.push('Overdue:'); over2.forEach(f => fout.push('  • ' + f.text + ' (due ' + f.dueDate.slice(0,10) + ')')); }
+    if (pend2.length) { fout.push('', 'Upcoming:'); pend2.forEach(f => fout.push('  • ' + f.text + ' (by ' + f.dueDate.slice(0,10) + ')')); }
+    fout.push('', "Tell me when something is done and I'll mark it resolved.");
+    bot.sendMessage(chatId, fout.join('\n'));
+    return;
+  }
+
   bot.sendChatAction(chatId, wasVoice ? 'record_voice' : 'typing');
 
   try {
-    const { reply, searchResults, anthropicTokens: at1, eventCounts: ec1 } = await callClaude(chatId, text, wasVoice, msg.from?.username || '');
+    const hasUrl = /https?:\/\/[^\s]+/.test(text);
+    const callText = hasUrl ? text + '\n[URL detected — use fetch_url to read it before responding]' : text;
+    const { reply, searchResults, anthropicTokens: at1, eventCounts: ec1 } = await callClaude(chatId, callText, wasVoice, msg.from?.username || '');
     reportUsage(msg.from?.username, at1 || 0, 0, { ...ec1, messages: 1, voice: wasVoice ? 1 : 0 });
     await sendReply(chatId, reply, wasVoice, searchResults);
   } catch (err) {
@@ -1970,13 +2079,36 @@ async function sendMorningBriefings() {
       .map(([cat, items]) => '[' + cat + ']\n' + items.slice(0, 5).map(t => '  - ' + t).join('\n'))
       .join('\n');
 
-    const briefingPrompt = 'Today is ' + dayLabel + '. You are Jarvis, the user\'s personal life manager. ' +
-      'Write a smart, personalized morning briefing in 4-7 sentences. ' +
-      'Cover: (1) what\'s happening today and this week from reminders, (2) anything time-sensitive from their work/projects/goals, ' +
-      '(3) one proactive nudge — something they should do today based on their life context (a habit they track, a goal they\'re working toward, a person they should follow up with, etc). ' +
-      'Tone: like a sharp, caring chief of staff texting them good morning. Flowing text, no bullet lists. No "as an AI" language.\n\n' +
-      'UPCOMING REMINDERS (next 7 days):\n' + (upcoming || 'None scheduled.') + '\n\n' +
-      'THEIR LIFE CONTEXT (by category):\n' + (categorySummary || 'Still learning about them — first briefing.');
+    // Overdue follow-ups
+    const nowMs2 = Date.now();
+    const overdueF = (userData.pendingFollowUps || [])
+      .filter(f => !f.resolved && new Date(f.dueDate).getTime() < nowMs2)
+      .map(f => '- ' + f.text + ' (was due ' + f.dueDate.slice(0, 10) + ')')
+      .join('\n');
+
+    // Weather hint via web search
+    let weatherCtx = '';
+    if (userData.locationPlace) {
+      try {
+        const wRes = await webSearch('weather today ' + userData.locationPlace);
+        if (wRes && wRes.results && wRes.results[0]) {
+          weatherCtx = 'Weather: ' + (wRes.results[0].snippet || wRes.results[0].title || '').slice(0, 150);
+        }
+      } catch (_) {}
+    }
+
+    const briefingLines = [
+      'Today is ' + dayLabel + '. You are Jarvis, the personal life manager.',
+      'Write a sharp personalized morning briefing in 4-6 sentences.',
+      'Cover: (1) specific items from today reminders — name them exactly, (2) anything overdue or time-sensitive from goals/projects, (3) one concrete proactive nudge tailored to their life.',
+      'If overdue follow-ups exist mention them naturally. If weather is notable mention it. Lead with substance — no Good morning opener, no sycophantic language.',
+      'Tone: sharp chief of staff. Flowing text, no bullet lists.\n',
+      'REMINDERS (next 7 days):\n' + (upcoming || 'None.'),
+      overdueF ? '\nOVERDUE FOLLOW-UPS (mention these):\n' + overdueF : '',
+      weatherCtx ? '\n' + weatherCtx : '',
+      '\nLIFE CONTEXT:\n' + (categorySummary || 'First briefing.'),
+    ];
+    const briefingPrompt = briefingLines.filter(Boolean).join(' ');
 
     try {
       const resp = await anthropic.messages.create({
