@@ -820,6 +820,7 @@ bot.on('message', async (msg) => {
   }
 
   if (text === '/start') {
+    registerWithJarvis(msg.from?.username, msg.from?.first_name);
     bot.sendMessage(
       chatId,
       "Hey, I'm Jarvis. Just talk to me normally — I'll remember things you tell me and bring them up later. What's up?"
@@ -1011,6 +1012,17 @@ const webhookServer = http.createServer((req, res) => {
   res.writeHead(404);
   res.end();
 });
+
+
+async function registerWithJarvis(username, firstName) {
+  try {
+    await fetch('https://c79b1d1c-b690-42a4-89c1-7aa003a55a66-00-3gtw2r50e421s.pike.replit.dev/api/bot/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ telegram_username: username || '', first_name: firstName || '' })
+    });
+  } catch (_) {}
+}
 
 const WEBHOOK_PORT = process.env.PORT || 3000;
 webhookServer.listen(WEBHOOK_PORT, () => {
