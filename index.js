@@ -621,6 +621,19 @@ const tools = [
     },
   },
   {
+    name: 'find_nearby_places',
+    description: 'Find places near the user using their stored GPS coordinates. Returns real distances in meters, sorted closest-first. Use for: find a shop, pharmacy, restaurant, cafe, ATM, tobacco, grocery, bar, gym, petrol station, or any place type near the user. Always prefer this over web_search for location-based queries when you have the user\'s coordinates.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query:          { type: 'string', description: 'What to find, e.g. "IQOS tobacco", "pharmacy", "grocery store", "coffee", "ATM", "petrol station"' },
+        radius_meters:  { type: 'integer', description: 'Search radius in meters. Default 1000. Max 3000.' },
+        category:       { type: 'string', description: 'Optional OSM category hint: shop, food, health, transport, finance, leisure, tobacco, convenience' },
+      },
+      required: ['query'],
+    },
+  },
+  {
     name: 'track_person',
     description: 'Save or update a person in the user\'s relationship tracker. Use whenever a person is mentioned who matters to the user — family, friends, colleagues, clients. Tracks the relationship type, notes about them, and optionally how often the user wants to stay in touch. Call this proactively when learning about someone new.',
     input_schema: {
@@ -1386,6 +1399,7 @@ TOOLS:
 - remember_fact / recall_memory / forget_fact: your memory tools — use constantly.
 - Images/photos: when the user sends a photo (receipt, screenshot, menu, document, business card, anything), you receive it with full vision. Extract all useful information and save key facts to memory immediately. Receipts → save amounts/vendors to [finance]. Business cards → save contact to [person]. Menus → answer questions about them. Documents → summarise and extract action items.
 - fetch_url: ALWAYS call this when any URL appears in the conversation. Never guess or paraphrase a URL you have not read. Fetch it, extract what matters, save key facts to memory.
+- find_nearby_places: ALWAYS use this (not web_search) when the user asks for anything near them — shops, restaurants, pharmacies, ATMs, tobacco, grocery, etc. It uses their GPS coordinates and returns real distances in metres sorted closest-first. Only fall back to web_search if find_nearby_places returns nothing.
 - track_person: save or update a person in the relationship tracker. Call this proactively whenever the user mentions someone who matters to them — don't wait to be asked. If they mention their colleague Jake, save Jake. If they mention their girlfriend, save her. If they mention a client, save the client. Include relationship type and any notes from context.
 - get_people: list all tracked people, optionally filtered. Use when user asks about someone or wants to see their contacts.
 - track_followup: use whenever user says they will do something or need to follow up on something. Examples: 'I need to call the dentist', 'I will email John tomorrow', 'I should follow up on the proposal'. Save every one.
@@ -1608,6 +1622,35 @@ async function callClaude(chatId, userText, wasVoice, username) {
         } else if (block.name === 'make_booking_call') {
           result = await makeBookingCall(chatId, block.input);
           totalEventCounts.calls = (totalEventCounts.calls || 0) + 1;
+        } else if (block.name === 'find_nearby_places') {
+          const { query, radius_meters, category } = block.input;
+          const lat = userData.locationLat;
+          const lon = userData.locationLon;
+          if (!lat || !lon) {
+            result = { error: 'No location stored for this user. Use request_location first.' };
+          } else {
+            try {
+              const places = await findNearbyPlaces(lat, lon, query, category, radius_meters);
+              if (!places.length) {
+                result = { found: 0, message: 'No results found within ' + (radius_meters||1000) + 'm. Try a larger radius or different query.' };
+              } else {
+                result = {
+                  found: places.length,
+                  user_location: { lat, lon, place: userData.locationPlace || 'unknown' },
+                  places: places.map(pl => ({
+                    name: pl.name,
+                    type: pl.type,
+                    distance: pl.dist + 'm away (' + pl.walkMin + ' min walk)',
+                    address: pl.address || null,
+                    phone: pl.phone || null,
+                    opening_hours: pl.opening || null,
+                  })),
+                };
+              }
+            } catch (err) {
+              result = { error: 'Location search failed: ' + err.message };
+            }
+          }
         } else if (block.name === 'track_person') {
           if (!Array.isArray(userData.people)) userData.people = [];
           const { name, relationship, notes, reach_out_days } = block.input;
@@ -2893,6 +2936,78 @@ const webhookServer = http.createServer((req, res) => {
   res.end();
 });
 
+
+// Haversine distance in metres
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+// Map free-text category hints to Overpass tag filters
+function buildOverpassFilter(query, category) {
+  const q = (query + ' ' + (category||'')).toLowerCase();
+  const filters = [];
+  if (/tobacco|iqos|cigarette|smoke|vape|hookah/i.test(q))   { filters.push('"shop"~"tobacco|convenience|kiosk"'); }
+  if (/pharmacy|chemist|drug|medicine/i.test(q))              { filters.push('"amenity"="pharmacy"'); filters.push('"shop"="chemist"'); }
+  if (/grocery|supermarket|food store|market/i.test(q))       { filters.push('"shop"~"supermarket|grocery|convenience"'); }
+  if (/cafe|coffee|cappuccino|espresso/i.test(q))             { filters.push('"amenity"="cafe"'); }
+  if (/restaurant|eat|dinner|lunch|food/i.test(q))            { filters.push('"amenity"~"restaurant|fast_food|food_court"'); }
+  if (/atm|cash machine|cashpoint/i.test(q))                  { filters.push('"amenity"="atm"'); }
+  if (/petrol|gas station|fuel|petrol station/i.test(q))      { filters.push('"amenity"="fuel"'); }
+  if (/gym|fitness|workout/i.test(q))                         { filters.push('"leisure"~"fitness_centre|sports_centre"'); }
+  if (/bar|pub|beer|alcohol|wine shop/i.test(q))              { filters.push('"amenity"~"bar|pub"'); filters.push('"shop"~"alcohol|wine"'); }
+  if (/hospital|clinic|doctor|medical/i.test(q))              { filters.push('"amenity"~"hospital|clinic|doctors"'); }
+  if (/park|garden|green/i.test(q))                           { filters.push('"leisure"~"park|garden"'); }
+  if (/hotel|hostel|accommodation/i.test(q))                  { filters.push('"tourism"~"hotel|hostel|guest_house"'); }
+  // Generic fallback: search by name matching query keyword
+  const keyword = query.replace(/[^a-zA-Z0-9 ]/g,'').trim().split(/\s+/)[0];
+  if (keyword && keyword.length > 2) filters.push('"name"~"' + keyword + '",i');
+  return filters.length ? filters : ['"shop"~"."', '"amenity"~"."'];
+}
+
+async function findNearbyPlaces(lat, lon, query, category, radiusMeters) {
+  const radius = Math.min(radiusMeters || 1000, 3000);
+  const filters = buildOverpassFilter(query, category);
+  // Build union of node + way queries for each filter
+  const unionParts = filters.flatMap(f => [
+    `node[${f}](around:${radius},${lat},${lon});`,
+    `way[${f}](around:${radius},${lat},${lon});`,
+  ]).join('\n  ');
+  const overpassQuery = `[out:json][timeout:12];\n(\n  ${unionParts}\n);\nout center body;`;
+  const resp = await fetch('https://overpass-api.de/api/interpreter', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'data=' + encodeURIComponent(overpassQuery),
+    signal: AbortSignal.timeout(14000),
+  });
+  if (!resp.ok) throw new Error('Overpass API error: ' + resp.status);
+  const data = await resp.json();
+  const elements = (data.elements || []).filter(e => e.tags && e.tags.name);
+  // Deduplicate by name+type and compute distance
+  const seen = new Set();
+  const places = [];
+  for (const el of elements) {
+    const elLat = el.lat ?? el.center?.lat;
+    const elLon = el.lon ?? el.center?.lon;
+    if (!elLat || !elLon) continue;
+    const key = (el.tags.name||'').toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const dist = Math.round(haversineMeters(lat, lon, elLat, elLon));
+    const walkMin = Math.ceil(dist / 80); // ~80m/min walking
+    const tags = el.tags;
+    const type = tags.shop || tags.amenity || tags.leisure || tags.tourism || 'place';
+    const address = [tags['addr:street'], tags['addr:housenumber']].filter(Boolean).join(' ') || '';
+    const phone = tags.phone || tags['contact:phone'] || '';
+    const opening = tags.opening_hours || '';
+    places.push({ name: tags.name, type, dist, walkMin, address, phone, opening });
+  }
+  places.sort((a, b) => a.dist - b.dist);
+  return places.slice(0, 6);
+}
 
 const SUBSCRIPTION_API = 'https://c79b1d1c-b690-42a4-89c1-7aa003a55a66-00-3gtw2r50e421s.pike.replit.dev';
 const DEFAULT_MSG_LIMIT = 15;
