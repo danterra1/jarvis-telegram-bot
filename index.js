@@ -1595,22 +1595,16 @@ async function sendProactiveCheckin() {
     const dayLabel = localDate.toLocaleDateString('en-US', { weekday: 'long' });
 
     const checkinPrompt =
-      'You are Jarvis, the user's personal life manager. It's ' + timeOfDay + ' on ' + dayLabel + '. ' +
-      'Review everything you know about them below and decide: is there anything worth proactively saying right now? ' +
-      'This could be: a deadline or reminder coming up today they should prep for, a goal they're drifting from, ' +
-      'a habit they should be doing right now, a follow-up they mentioned but haven't done, ' +
-      'something time-sensitive in their work or finances, or a useful nudge based on the time of day. ' +
-      'IMPORTANT: Only send a message if there is genuinely something useful to say. ' +
-      'If everything looks fine and there's nothing actionable, respond with exactly: NO_CHECKIN ' +
-      'Keep the message short (2-3 sentences max). Conversational, not preachy. Like a smart manager checking in briefly.
-
-' +
-      'THEIR LIFE CONTEXT:
-' + allMemories + '
-
-' +
-      'TODAY'S REMAINING REMINDERS:
-' + (upcomingToday || 'None.');
+      "You are Jarvis, the user's personal life manager. It's " + timeOfDay + " on " + dayLabel + ". " +
+      "Review everything you know about them below and decide: is there anything worth proactively saying right now? " +
+      "This could be: a deadline or reminder coming up today they should prep for, a goal they're drifting from, " +
+      "a habit they should be doing right now, a follow-up they mentioned but haven't done, " +
+      "something time-sensitive in their work or finances, or a useful nudge based on the time of day. " +
+      "IMPORTANT: Only send a message if there is genuinely something useful to say. " +
+      "If everything looks fine and there's nothing actionable, respond with exactly: NO_CHECKIN " +
+      "Keep the message short (2-3 sentences max). Conversational, not preachy. Like a smart manager checking in briefly.\n\n" +
+      "THEIR LIFE CONTEXT:\n" + allMemories + "\n\n" +
+      "TODAY'S REMAINING REMINDERS:\n" + (upcomingToday || "None.")
 
     try {
       const resp = await anthropic.messages.create({
