@@ -1029,4 +1029,33 @@ webhookServer.listen(WEBHOOK_PORT, () => {
   console.log(`Webhook server listening on port ${WEBHOOK_PORT}`);
 });
 
+
+// ---------- One-time migration: register existing users in admin panel ----------
+async function migrateExistingUsers() {
+  let files;
+  try {
+    files = fs.readdirSync(DATA_DIR).filter(f =>
+      f.startsWith('user_') && f.endsWith('.json') &&
+      !f.includes('.corrupt-') && !f.endsWith('.tmp')
+    );
+  } catch (e) { return; }
+
+  console.log('[migrate] Found', files.length, 'existing users to sync...');
+  for (const file of files) {
+    const chatId = file.slice('user_'.length, -'.json'.length);
+    try {
+      const chat = await bot.getChat(chatId);
+      if (chat.username) {
+        await registerWithJarvis(chat.username, chat.first_name || '');
+        console.log('[migrate] Synced @' + chat.username);
+      }
+    } catch (e) {
+      console.warn('[migrate] Skipped chatId', chatId, e.message);
+    }
+    await new Promise(r => setTimeout(r, 300)); // avoid Telegram rate limits
+  }
+  console.log('[migrate] Done.');
+}
+migrateExistingUsers();
+
 console.log('Jarvis Telegram bot is running...');
