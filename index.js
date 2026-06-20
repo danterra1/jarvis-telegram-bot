@@ -46,7 +46,7 @@ function userFile(chatId) {
 const DATA_VERSION = 2;
 
 function emptyUserData(username, firstName) {
-  return { version: DATA_VERSION, memories: [], history: [], reminders: [], username: username || '', firstName: firstName || '' };
+  return { version: DATA_VERSION, memories: [], history: [], reminders: [], schedule: [], pendingFollowUps: [], warnedEvents: {}, username: username || '', firstName: firstName || '' };
 }
 
 function loadUserData(chatId) {
@@ -66,6 +66,8 @@ function loadUserData(chatId) {
       if (typeof data.checkinSlots === 'undefined') data.checkinSlots = {};
       if (typeof data.savedAddresses === 'undefined') data.savedAddresses = {};
       if (!Array.isArray(data.pendingFollowUps)) data.pendingFollowUps = [];
+      if (!Array.isArray(data.schedule)) data.schedule = [];
+      if (typeof data.warnedEvents === 'undefined') data.warnedEvents = {};
       if (!Array.isArray(data.history)) data.history = [];
       if (!Array.isArray(data.reminders)) data.reminders = [];
       data.version = DATA_VERSION;
@@ -481,6 +483,80 @@ const tools = [
         text: { type: 'string', description: 'Keyword matching the follow-up to resolve' },
       },
       required: ['text'],
+    },
+  },
+  {
+    name: 'add_event',
+    description: "Add an event to the user's personal schedule. Use whenever the user mentions a meeting, appointment, call, deadline, class, workout, flight, dinner plan, or any time-specific commitment. Extract the date, time, and title from context. Always confirm what you saved. For recurring events (weekly standup, daily gym etc) set recurring field.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: 'Event name, e.g. Team standup, Dentist appointment, Gym' },
+        date: { type: 'string', description: 'Date in YYYY-MM-DD format in the user local timezone' },
+        start_time: { type: 'string', description: 'Start time in HH:MM 24h format, e.g. 14:30. Omit if all-day.' },
+        end_time: { type: 'string', description: 'End time in HH:MM 24h format. Optional.' },
+        location: { type: 'string', description: 'Where the event takes place. Optional.' },
+        notes: { type: 'string', description: 'Extra context, prep needed, who is attending, etc. Optional.' },
+        recurring: { type: 'string', description: 'daily | weekly | monthly | yearly — if the event repeats. Omit for one-off.' },
+        category: { type: 'string', description: 'work | personal | health | social | travel' },
+      },
+      required: ['title', 'date'],
+    },
+  },
+  {
+    name: 'list_events',
+    description: "List the user's scheduled events for a given date or date range. Use whenever they ask 'what do I have today/tomorrow/this week', want to check their schedule, or when you need to check for conflicts before booking something.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        date_from: { type: 'string', description: 'Start date YYYY-MM-DD. Use today if not specified.' },
+        date_to: { type: 'string', description: 'End date YYYY-MM-DD (inclusive). Omit for single day.' },
+      },
+      required: ['date_from'],
+    },
+  },
+  {
+    name: 'update_event',
+    description: 'Update an existing scheduled event — change time, location, title, add notes, etc.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        event_id: { type: 'string', description: 'ID of the event to update' },
+        title_keyword: { type: 'string', description: 'Keyword to find the event by title if ID unknown' },
+        title: { type: 'string', description: 'New title' },
+        date: { type: 'string', description: 'New date YYYY-MM-DD' },
+        start_time: { type: 'string', description: 'New start time HH:MM' },
+        end_time: { type: 'string', description: 'New end time HH:MM' },
+        location: { type: 'string', description: 'New location' },
+        notes: { type: 'string', description: 'New or additional notes' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'remove_event',
+    description: 'Remove/cancel an event from the schedule.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        event_id: { type: 'string', description: 'ID of the event to remove' },
+        title_keyword: { type: 'string', description: 'Keyword to find the event by title if ID unknown' },
+        date: { type: 'string', description: 'Date to narrow down the search YYYY-MM-DD. Optional.' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'check_conflicts',
+    description: 'Check whether a proposed time slot conflicts with existing scheduled events. Use before booking restaurants, rides, or anything time-specific to make sure the user is actually free.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        date: { type: 'string', description: 'Date to check YYYY-MM-DD' },
+        start_time: { type: 'string', description: 'Proposed start time HH:MM' },
+        end_time: { type: 'string', description: 'Proposed end time HH:MM. Optional.' },
+      },
+      required: ['date', 'start_time'],
     },
   },
 ];
@@ -1095,6 +1171,20 @@ function buildSystemPrompt(userData) {
   const locationLine = userData.locationPlace
     ? `\n\nThe user is based in ${userData.locationPlace} (${userData.locationTimezone || 'UTC'}). Always use this for timezone, weather, and location-based queries unless they share a different location.`
     : '';
+  // Build today + tomorrow schedule for system prompt
+  const _todayStr = (() => { const off = userData.locationUtcOffset || 0; return new Date(Date.now() + off * 3600000).toISOString().slice(0, 10); })();
+  const _tomorrowStr = (() => { const off = userData.locationUtcOffset || 0; return new Date(Date.now() + off * 3600000 + 86400000).toISOString().slice(0, 10); })();
+  const _sched = Array.isArray(userData.schedule) ? userData.schedule : [];
+  const _todayEvs = _sched.filter(e => e.date === _todayStr).sort((a,b) => (a.startTime||'00:00').localeCompare(b.startTime||'00:00'));
+  const _tmrEvs   = _sched.filter(e => e.date === _tomorrowStr).sort((a,b) => (a.startTime||'00:00').localeCompare(b.startTime||'00:00'));
+  const _fmtEv = e => (e.startTime ? e.startTime + (e.endTime ? '-'+e.endTime : '') + ' ' : '') + e.title + (e.location ? ' @ '+e.location : '') + (e.notes ? ' ('+e.notes+')' : '');
+  const scheduleSection = [
+    'YOUR SCHEDULE:',
+    'Today (' + _todayStr + '): ' + (_todayEvs.length ? _todayEvs.map(_fmtEv).join(' | ') : 'nothing scheduled'),
+    'Tomorrow (' + _tomorrowStr + '): ' + (_tmrEvs.length ? _tmrEvs.map(_fmtEv).join(' | ') : 'nothing scheduled'),
+    _sched.length ? '(' + _sched.length + ' total events in calendar)' : '(Calendar is empty — add events as user mentions them)',
+  ].join('\n');
+
   const base = `You are Jarvis — not just an assistant, but the user's personal chief of staff and life manager, available over Telegram. You think like a combination of a brilliant personal assistant, a trusted advisor, and a sharp friend who happens to know everything about them. The current UTC date/time is ${nowIso}.
 
 CORE ROLE — LIFE MANAGEMENT:
@@ -1203,6 +1293,15 @@ TOOLS:
 - fetch_url: ALWAYS call this when any URL appears in the conversation. Never guess or paraphrase a URL you have not read. Fetch it, extract what matters, save key facts to memory.
 - track_followup: use whenever user says they will do something or need to follow up on something. Examples: 'I need to call the dentist', 'I will email John tomorrow', 'I should follow up on the proposal'. Save every one.
 - resolve_followup: when user says they completed something tracked as a follow-up, find and mark it resolved.
+- add_event: save ANY time-specific commitment the user mentions — meetings, calls, appointments, gym sessions, flights, dinners, deadlines, classes. Do this proactively without being asked. If they say 'I have a call tomorrow at 3' → add_event immediately.
+- list_events: check the schedule before booking anything time-specific. Always check for conflicts.
+- update_event / remove_event: when events change or get cancelled.
+- check_conflicts: before booking a restaurant, ride, or activity — verify the user is actually free at that time.
+
+SCHEDULE AWARENESS:
+You are the user's calendar. Every time-specific thing they mention gets added. You proactively check for conflicts. When they ask about their day/week, call list_events. Before booking anything, call check_conflicts.
+
+${scheduleSection}
 
 ${locationLine}`;
 
@@ -1373,6 +1472,19 @@ async function callClaude(chatId, userText, wasVoice, username) {
             });
             result = { ok: true, buttons_sent: true, restaurant_name: result.restaurant_name, note: 'Booking button sent as tappable Telegram button — DO NOT paste URL. One short sentence.' };
           }
+        } else if (block.name === 'add_event') {
+          result = addEvent(userData, block.input);
+          saveUserData(chatId, userData);
+        } else if (block.name === 'list_events') {
+          result = listEvents(userData, block.input.date_from, block.input.date_to);
+        } else if (block.name === 'update_event') {
+          result = updateEvent(userData, block.input);
+          saveUserData(chatId, userData);
+        } else if (block.name === 'remove_event') {
+          result = removeEvent(userData, block.input);
+          saveUserData(chatId, userData);
+        } else if (block.name === 'check_conflicts') {
+          result = checkConflicts(userData, block.input.date, block.input.start_time, block.input.end_time);
         } else if (block.name === 'fetch_url') {
           result = await fetchUrl(block.input.url, block.input.focus);
         } else if (block.name === 'track_followup') {
@@ -1476,6 +1588,104 @@ async function synthesizeSpeech(text) {
   } catch (err) {
     return { error: 'Speech synthesis failed: ' + err.message };
   }
+}
+
+// ---------- Schedule management ----------
+function localDateStr(userData) {
+  const offset = userData.locationUtcOffset || 0;
+  return new Date(Date.now() + offset * 3600000).toISOString().slice(0, 10);
+}
+
+function addEvent(userData, input) {
+  if (!Array.isArray(userData.schedule)) userData.schedule = {};
+  if (!Array.isArray(userData.schedule)) userData.schedule = [];
+  const ev = {
+    id: 'evt_' + Date.now(),
+    title: input.title,
+    date: input.date,
+    startTime: input.start_time || null,
+    endTime: input.end_time || null,
+    location: input.location || null,
+    notes: input.notes || null,
+    recurring: input.recurring || null,
+    category: input.category || 'personal',
+    createdAt: new Date().toISOString(),
+  };
+  userData.schedule.push(ev);
+  // If recurring, generate next 52 occurrences so they show up in queries
+  if (ev.recurring) {
+    const base = new Date(ev.date + 'T00:00:00Z');
+    const intervals = { daily: 1, weekly: 7, monthly: 30, yearly: 365 };
+    const days = intervals[ev.recurring] || 7;
+    const limit = ev.recurring === 'yearly' ? 5 : ev.recurring === 'monthly' ? 12 : ev.recurring === 'daily' ? 90 : 52;
+    for (let i = 1; i <= limit; i++) {
+      const d = new Date(base.getTime() + i * days * 86400000);
+      userData.schedule.push({ ...ev, id: 'evt_' + Date.now() + '_' + i, date: d.toISOString().slice(0, 10), recurring: null, parentId: ev.id });
+    }
+  }
+  const timeStr = ev.startTime ? ' at ' + ev.startTime : '';
+  const locStr = ev.location ? ' @ ' + ev.location : '';
+  return { ok: true, event: ev, message: 'Saved: ' + ev.title + ' on ' + ev.date + timeStr + locStr + '.' };
+}
+
+function listEvents(userData, dateFrom, dateTo) {
+  if (!Array.isArray(userData.schedule)) return { ok: true, events: [], message: 'No events scheduled.' };
+  const to = dateTo || dateFrom;
+  const evs = userData.schedule
+    .filter(e => e.date >= dateFrom && e.date <= to)
+    .sort((a, b) => (a.date + (a.startTime || '00:00')).localeCompare(b.date + (b.startTime || '00:00')));
+  if (!evs.length) return { ok: true, events: [], message: 'Nothing scheduled from ' + dateFrom + (dateTo ? ' to ' + dateTo : '') + '.' };
+  const formatted = evs.map(e => {
+    const t = e.startTime ? e.startTime + (e.endTime ? '-' + e.endTime : '') + ' ' : '';
+    const l = e.location ? ' @ ' + e.location : '';
+    return e.date + ' ' + t + e.title + l + (e.notes ? ' [' + e.notes + ']' : '');
+  });
+  return { ok: true, events: evs, formatted, count: evs.length };
+}
+
+function updateEvent(userData, input) {
+  if (!Array.isArray(userData.schedule)) return { error: 'No schedule found.' };
+  let ev = input.event_id ? userData.schedule.find(e => e.id === input.event_id) : null;
+  if (!ev && input.title_keyword) {
+    const kw = input.title_keyword.toLowerCase();
+    const filtered = input.date ? userData.schedule.filter(e => e.date === input.date) : userData.schedule;
+    ev = filtered.find(e => e.title.toLowerCase().includes(kw));
+  }
+  if (!ev) return { error: 'Event not found. Try listing events first.' };
+  if (input.title)      ev.title     = input.title;
+  if (input.date)       ev.date      = input.date;
+  if (input.start_time) ev.startTime = input.start_time;
+  if (input.end_time)   ev.endTime   = input.end_time;
+  if (input.location)   ev.location  = input.location;
+  if (input.notes)      ev.notes     = input.notes;
+  ev.updatedAt = new Date().toISOString();
+  return { ok: true, event: ev, message: 'Updated: ' + ev.title + ' on ' + ev.date + (ev.startTime ? ' at ' + ev.startTime : '') + '.' };
+}
+
+function removeEvent(userData, input) {
+  if (!Array.isArray(userData.schedule)) return { error: 'No schedule.' };
+  let idx = input.event_id ? userData.schedule.findIndex(e => e.id === input.event_id) : -1;
+  if (idx < 0 && input.title_keyword) {
+    const kw = input.title_keyword.toLowerCase();
+    const candidates = input.date ? userData.schedule.filter(e => e.date === input.date) : userData.schedule;
+    const match = candidates.find(e => e.title.toLowerCase().includes(kw));
+    if (match) idx = userData.schedule.findIndex(e => e.id === match.id);
+  }
+  if (idx < 0) return { error: 'Event not found.' };
+  const removed = userData.schedule.splice(idx, 1)[0];
+  return { ok: true, removed: removed.title, date: removed.date, message: 'Removed: ' + removed.title + ' on ' + removed.date + '.' };
+}
+
+function checkConflicts(userData, date, startTime, endTime) {
+  if (!Array.isArray(userData.schedule)) return { ok: true, conflicts: [], free: true };
+  const dayEvents = userData.schedule.filter(e => e.date === date && e.startTime);
+  const proposed = { start: startTime, end: endTime || startTime };
+  const conflicts = dayEvents.filter(e => {
+    const evEnd = e.endTime || e.startTime;
+    return !(proposed.end <= e.startTime || proposed.start >= evEnd);
+  });
+  if (!conflicts.length) return { ok: true, free: true, message: 'No conflicts on ' + date + ' at ' + startTime + '.' };
+  return { ok: true, free: false, conflicts: conflicts.map(e => e.startTime + ' ' + e.title), message: 'Conflict: ' + conflicts.map(e => e.title + ' at ' + e.startTime).join(', ') };
 }
 
 // ---------- Fetch text content from a URL ----------
@@ -1787,6 +1997,7 @@ bot.on('message', async (msg) => {
       '',
       'Upcoming reminders:\n' + remindersLine,
       '',
+      'Schedule: ' + ((d.schedule || []).length) + ' events — /today  /week  /calendar',
       'Commands: /me  /memories  /spending  /followups  /forget_everything',
     ];
     bot.sendMessage(chatId, lines.join('\n'));
@@ -1807,6 +2018,38 @@ bot.on('message', async (msg) => {
       .map(([cat, items]) => `*${cat}*\n` + items.map((m) => `• ${m.text}`).join('\n'))
       .join('\n\n');
     bot.sendMessage(chatId, `Everything stored (${userData.memories.length} items) — use /me for a formatted summary:\n\n${lines}`, { parse_mode: 'Markdown' });
+    return;
+  }
+
+  if (text === '/today' || text === '/week' || text === '/calendar') {
+    const td = loadUserData(chatId);
+    const off = td.locationUtcOffset || 0;
+    const todayD = new Date(Date.now() + off * 3600000).toISOString().slice(0, 10);
+    let dateFrom = todayD;
+    let dateTo = todayD;
+    if (text === '/week') { const d = new Date(Date.now() + off*3600000 + 6*86400000); dateTo = d.toISOString().slice(0,10); }
+    if (text === '/calendar') { const d = new Date(Date.now() + off*3600000 + 29*86400000); dateTo = d.toISOString().slice(0,10); }
+    const res = listEvents(td, dateFrom, dateTo);
+    if (!res.events.length) {
+      const label = text === '/today' ? 'today' : text === '/week' ? 'this week' : 'the next 30 days';
+      bot.sendMessage(chatId, 'Nothing scheduled for ' + label + '.\nTell me about meetings, calls, or appointments and I\'ll add them.');
+      return;
+    }
+    // Group by date
+    const byDate = {};
+    for (const e of res.events) (byDate[e.date] = byDate[e.date] || []).push(e);
+    const lines2 = [];
+    for (const [date, evs] of Object.entries(byDate).sort()) {
+      const label2 = date === todayD ? 'Today' : date === new Date(Date.now()+off*3600000+86400000).toISOString().slice(0,10) ? 'Tomorrow' : date;
+      lines2.push(label2 + ':');
+      for (const e of evs) {
+        const t = e.startTime ? e.startTime + (e.endTime ? '-'+e.endTime : '') + ' ' : '';
+        const l = e.location ? ' @ ' + e.location : '';
+        lines2.push('  • ' + t + e.title + l);
+      }
+    }
+    lines2.push('', 'Commands: /today  /week  /calendar  — or just ask me');
+    bot.sendMessage(chatId, lines2.join('\n'));
     return;
   }
 
@@ -2097,12 +2340,24 @@ async function sendMorningBriefings() {
       } catch (_) {}
     }
 
+    // Today's structured events
+    const briefDateOff = userData.locationUtcOffset || 0;
+    const briefTodayStr = new Date(Date.now() + briefDateOff * 3600000).toISOString().slice(0, 10);
+    const briefTodayEvs = (userData.schedule || [])
+      .filter(e => e.date === briefTodayStr)
+      .sort((a, b) => (a.startTime || '00:00').localeCompare(b.startTime || '00:00'))
+      .map(e => (e.startTime ? e.startTime + ' ' : '') + e.title + (e.location ? ' @ ' + e.location : ''));
+    const scheduleContext = briefTodayEvs.length
+      ? 'TODAY\'S CALENDAR:\n' + briefTodayEvs.map(s => '- ' + s).join('\n')
+      : 'TODAY\'S CALENDAR: Nothing scheduled.';
+
     const briefingLines = [
       'Today is ' + dayLabel + '. You are Jarvis, the personal life manager.',
       'Write a sharp personalized morning briefing in 4-6 sentences.',
       'Cover: (1) specific items from today reminders — name them exactly, (2) anything overdue or time-sensitive from goals/projects, (3) one concrete proactive nudge tailored to their life.',
       'If overdue follow-ups exist mention them naturally. If weather is notable mention it. Lead with substance — no Good morning opener, no sycophantic language.',
       'Tone: sharp chief of staff. Flowing text, no bullet lists.\n',
+      scheduleContext,
       'REMINDERS (next 7 days):\n' + (upcoming || 'None.'),
       overdueF ? '\nOVERDUE FOLLOW-UPS (mention these):\n' + overdueF : '',
       weatherCtx ? '\n' + weatherCtx : '',
@@ -2291,7 +2546,41 @@ async function sendProactiveCheckin() {
   }
 }
 
+// Pre-event alerts: 30 min before each scheduled event
+async function checkEventReminders() {
+  let files;
+  try { files = fs.readdirSync(DATA_DIR).filter(f => f.startsWith('user_') && f.endsWith('.json') && !f.includes('.corrupt') && !f.endsWith('.tmp')); }
+  catch (_) { return; }
+  for (const file of files) {
+    const chatId = file.slice('user_'.length, -'.json'.length);
+    let ud;
+    try { ud = JSON.parse(fs.readFileSync(path.join(DATA_DIR, file), 'utf8')); } catch (_) { continue; }
+    if (!Array.isArray(ud.schedule) || !ud.schedule.length) continue;
+    const off = ud.locationUtcOffset || 0;
+    const nowLocal = new Date(Date.now() + off * 3600000);
+    const todayStr2 = nowLocal.toISOString().slice(0, 10);
+    const nowMins = nowLocal.getUTCHours() * 60 + nowLocal.getUTCMinutes();
+    if (!ud.warnedEvents) ud.warnedEvents = {};
+    let changed = false;
+    for (const ev of ud.schedule) {
+      if (ev.date !== todayStr2 || !ev.startTime) continue;
+      const [h, m] = ev.startTime.split(':').map(Number);
+      const evMins = h * 60 + m;
+      const minsUntil = evMins - nowMins;
+      if (minsUntil >= 25 && minsUntil <= 35 && !ud.warnedEvents[ev.id]) {
+        ud.warnedEvents[ev.id] = true;
+        changed = true;
+        const locPart = ev.location ? ' @ ' + ev.location : '';
+        const notesPart = ev.notes ? '\n' + ev.notes : '';
+        await bot.sendMessage(chatId, '30 min: ' + ev.title + locPart + notesPart).catch(() => {});
+      }
+    }
+    if (changed) saveUserData(chatId, ud);
+  }
+}
+
 setInterval(checkReminders, 60 * 1000);
+setInterval(checkEventReminders, 60 * 1000);  // 30-min pre-event alerts
 setInterval(checkUpcomingDeadlines, 60 * 60 * 1000); // hourly: 3-day and 1-day warnings
 setInterval(sendMorningBriefings, 15 * 60 * 1000);   // every 15 min: 8 AM local briefing
 setInterval(sendWeeklyReview, 15 * 60 * 1000);        // every 15 min: Sunday 7 PM life review
