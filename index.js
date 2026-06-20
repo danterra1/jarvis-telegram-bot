@@ -327,9 +327,27 @@ const tools = [
     },
   },
   {
+    name: 'book_restaurant_online',
+    description:
+      "Book a restaurant via OpenTable or Resy — no phone call needed. ALWAYS try this before make_booking_call. Use web_search to find the restaurant on OpenTable or Resy, then call this tool with the booking details and the URL you found. Returns a pre-filled one-tap booking link the user can confirm instantly. If the restaurant is not on any online platform, fall back to make_booking_call.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        business_name: { type: 'string', description: 'Name of the restaurant' },
+        location: { type: 'string', description: 'City or neighborhood (e.g. "New York", "Tbilisi Georgia")' },
+        date_time_iso: { type: 'string', description: 'ISO 8601 datetime for the reservation, e.g. "2025-06-21T20:00:00"' },
+        party_size: { type: 'integer', description: 'Number of people' },
+        reservation_name: { type: 'string', description: 'Name to put the reservation under' },
+        opentable_url: { type: 'string', description: 'OpenTable URL for this restaurant if found via web_search. Include if found.' },
+        resy_url: { type: 'string', description: 'Resy URL for this restaurant if found via web_search. Include if found.' },
+      },
+      required: ['business_name', 'location', 'date_time_iso', 'party_size', 'reservation_name'],
+    },
+  },
+  {
     name: 'make_booking_call',
     description:
-      "Place a real outbound phone call on the user's behalf to book a restaurant reservation (or similar booking). Use this when the user asks you to call and book a table somewhere. You need a phone number for the business — if you don't already have one in memory or from a recent web_search, call web_search first to try to find it. If you still can't find a reliable phone number, do NOT guess one — ask the user to provide it instead. Before calling this tool, briefly tell the user what you're about to do (who you're calling, for what, at what time) in your reply text, since the call happens immediately and asynchronously. The outcome of the call will be reported back to the user separately once the call finishes, it is not returned by this tool.",
+      "FALLBACK ONLY — use book_restaurant_online first. Place a real outbound phone call on the user's behalf to book a restaurant reservation. Use this only when the restaurant is NOT found on OpenTable or Resy. You need a phone number — find it via web_search. If you still can't find one, ask the user. Before calling, briefly tell the user what you're about to do.",
     input_schema: {
       type: 'object',
       properties: {
@@ -632,7 +650,8 @@ TOOLS:
 - web_search: use for recommendations, current events, anything you can't confidently answer from memory. Always include real names, addresses, links from results — never invent URLs.
 - request_location: use when you need their location and don't have it saved. They only need to share once — you'll remember forever.
 - set_reminder: convert any relative time to exact ISO datetime using their saved timezone. For yearly events (birthdays, anniversaries) set recurrence and is_gift_occasion.
-- make_booking_call: call restaurants on their behalf. Find the number via web_search first. Tell them what you're about to do before calling.
+- book_restaurant_online: ALWAYS try this first for restaurant bookings. Use web_search to find the restaurant on OpenTable or Resy, pass the URL here, get back a one-tap booking link the user can confirm immediately. No call needed.
+- make_booking_call: FALLBACK ONLY — use only when the restaurant is not found on OpenTable or Resy. Find the phone number via web_search first. Tell the user what you're about to do before calling.
 - remember_fact / recall_memory / forget_fact: your memory tools — use constantly.
 
 ${locationLine}`;
@@ -728,6 +747,9 @@ async function callClaude(chatId, userText, wasVoice, username) {
           result = setReminder(userData, block.input.text, block.input.when_iso, block.input.recurrence, block.input.is_gift_occasion);
           totalEventCounts.reminders = (totalEventCounts.reminders || 0) + 1;
           saveUserData(chatId, userData);
+        } else if (block.name === 'book_restaurant_online') {
+          result = await bookRestaurantOnline(block.input);
+          totalEventCounts.calls = (totalEventCounts.calls || 0) + 1;
         } else if (block.name === 'make_booking_call') {
           result = await makeBookingCall(chatId, block.input);
           totalEventCounts.calls = (totalEventCounts.calls || 0) + 1;
