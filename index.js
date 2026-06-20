@@ -4,7 +4,6 @@ import Anthropic from '@anthropic-ai/sdk';
 import fs from 'fs';
 import path from 'path';
 import http from 'http';
-import pg from 'pg';
 
 // ---------- Config ----------
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -14,6 +13,8 @@ const TAVILY_KEY = process.env.TAVILY_API_KEY; // used for web search
 const VAPI_KEY = process.env.VAPI_API_KEY; // used for outbound phone calls (restaurant bookings, etc.)
 const VAPI_PHONE_NUMBER_ID = process.env.VAPI_PHONE_NUMBER_ID; // the Vapi phone number to call FROM
 const PUBLIC_URL = process.env.PUBLIC_URL; // public base URL of this service, used for Vapi's webhook callback
+const REPLIT_API = process.env.REPLIT_API_URL || 'https://c79b1d1c-b690-42a4-89c1-7aa003a55a66-00-3gtw2r50e421s.pike.replit.dev';
+const BOT_SECRET = process.env.ADMIN_SECRET || ''; // same ADMIN_SECRET set in Railway
 
 if (!TELEGRAM_TOKEN || !ANTHROPIC_KEY) {
   console.error('Missing TELEGRAM_BOT_TOKEN or ANTHROPIC_API_KEY in environment.');
@@ -41,37 +42,30 @@ const userDataCache = {};
 const DATA_DIR = path.join(process.cwd(), 'data');
 try { if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR); } catch(_) {}
 
-let pool = null;
-if (process.env.DATABASE_URL) {
-  pool = new pg.Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
-    max: 5,
-  });
-} else {
-  console.warn('DATABASE_URL not set — data lives only in memory and resets on restart.');
-}
-
-const SQL_UPSERT = 'INSERT INTO user_data (chat_id, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (chat_id) DO UPDATE SET data = $2, updated_at = NOW()';
-const SQL_SELECT_ALL = 'SELECT chat_id, data FROM user_data';
-const SQL_CREATE_TABLE = 'CREATE TABLE IF NOT EXISTS user_data (chat_id TEXT PRIMARY KEY, data JSONB NOT NULL, updated_at TIMESTAMPTZ DEFAULT NOW())';
+// HTTP-backed storage — calls Replit API instead of Postgres directly
+const DB_HEADERS = { 'Content-Type': 'application/json', 'x-bot-secret': BOT_SECRET };
 
 async function dbUpsert(chatId, data) {
-  if (!pool) return;
-  try { await pool.query(SQL_UPSERT, [String(chatId), JSON.stringify(data)]); }
-  catch (err) { console.error('DB upsert failed for', chatId, err.message); }
+  try {
+    await fetch(REPLIT_API + '/api/bot-data/' + String(chatId), {
+      method: 'PUT', headers: DB_HEADERS, body: JSON.stringify(data),
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch (err) { console.error('dbUpsert HTTP failed for', chatId, err.message); }
 }
 
 async function initDb(attempt = 1) {
-  if (!pool) { console.warn('No DATABASE_URL — data will reset on restart.'); return; }
   try {
-    await pool.query(SQL_CREATE_TABLE);
-    const res = await pool.query(SQL_SELECT_ALL);
-    for (const row of res.rows) {
+    const r = await fetch(REPLIT_API + '/api/bot-data/all', {
+      headers: DB_HEADERS, signal: AbortSignal.timeout(10000),
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const rows = await r.json();
+    for (const row of rows) {
       const d = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
       userDataCache[String(row.chat_id)] = applyBackfill(d);
     }
-    console.log('DB ready. Loaded', res.rows.length, 'users into cache.');
+    console.log('DB ready. Loaded', rows.length, 'users into cache via Replit API.');
   } catch (err) {
     console.error('initDb error (attempt ' + attempt + '):', err.message);
     if (attempt < 3) {
@@ -79,7 +73,7 @@ async function initDb(attempt = 1) {
       await new Promise(r => setTimeout(r, 4000));
       return initDb(attempt + 1);
     }
-    console.warn('DB unavailable after retries — per-request fallback active.');
+    console.warn('DB unavailable after retries — running from empty cache.');
   }
 }
 
@@ -143,17 +137,17 @@ function loadUserData(chatId) {
 async function loadUserDataAsync(chatId) {
   const key = String(chatId);
   if (userDataCache[key]) return userDataCache[key];
-  if (pool) {
-    try {
-      const res = await pool.query('SELECT data FROM user_data WHERE chat_id = $1', [key]);
-      if (res.rows.length) {
-        const d = typeof res.rows[0].data === 'string' ? JSON.parse(res.rows[0].data) : res.rows[0].data;
-        userDataCache[key] = applyBackfill(d);
-        return userDataCache[key];
-      }
-    } catch (err) {
-      console.error('loadUserDataAsync DB read failed:', err.message);
+  try {
+    const r = await fetch(REPLIT_API + '/api/bot-data/' + key, {
+      headers: DB_HEADERS, signal: AbortSignal.timeout(5000),
+    });
+    if (r.ok) {
+      const d = await r.json();
+      userDataCache[key] = applyBackfill(d);
+      return userDataCache[key];
     }
+  } catch (err) {
+    console.error('loadUserDataAsync HTTP read failed:', err.message);
   }
   const fresh = emptyUserData();
   userDataCache[key] = fresh;
@@ -3047,7 +3041,7 @@ async function findNearbyPlaces(lat, lon, query, category, radiusMeters) {
   return places.slice(0, 6);
 }
 
-const SUBSCRIPTION_API = 'https://c79b1d1c-b690-42a4-89c1-7aa003a55a66-00-3gtw2r50e421s.pike.replit.dev';
+const SUBSCRIPTION_API = REPLIT_API; // now uses the top-level REPLIT_API constant
 const DEFAULT_MSG_LIMIT = 15;
 
 async function checkSubscription(username) {
