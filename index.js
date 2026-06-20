@@ -2543,17 +2543,33 @@ async function sendProactiveCheckin() {
     const timeOfDay = localHour < 12 ? 'morning' : localHour < 17 ? 'afternoon' : 'evening';
     const dayLabel = localDate.toLocaleDateString('en-US', { weekday: 'long' });
 
+    // Build schedule + follow-up context
+    const todayStr3 = new Date(localMs).toISOString().slice(0, 10);
+    const upcomingEvents = (userData.schedule || [])
+      .filter(e => e.date === todayStr3)
+      .sort((a, b) => (a.startTime || '').localeCompare(b.startTime || ''))
+      .map(e => (e.startTime || '') + ' ' + e.title + (e.location ? ' @ ' + e.location : ''))
+      .join('\n');
+    const pendingTasks = (userData.pendingFollowUps || [])
+      .filter(f => !f.resolved)
+      .map(f => '- ' + f.text)
+      .join('\n');
+
     const checkinPrompt =
-      "You are Jarvis, the user's personal life manager. It's " + timeOfDay + " on " + dayLabel + ". " +
-      "Review everything you know about them below and decide: is there anything worth proactively saying right now? " +
-      "This could be: a deadline or reminder coming up today they should prep for, a goal they're drifting from, " +
-      "a habit they should be doing right now, a follow-up they mentioned but haven't done, " +
-      "something time-sensitive in their work or finances, or a useful nudge based on the time of day. " +
-      "IMPORTANT: Only send a message if there is genuinely something useful to say. " +
-      "If everything looks fine and there's nothing actionable, respond with exactly: NO_CHECKIN " +
-      "Keep the message short (2-3 sentences max). Conversational, not preachy. Like a smart manager checking in briefly.\n\n" +
-      "THEIR LIFE CONTEXT:\n" + allMemories + "\n\n" +
-      "TODAY'S REMAINING REMINDERS:\n" + (upcomingToday || "None.")
+      "You are Jarvis — the user's personal AI and closest digital companion. " +
+      "It's " + timeOfDay + " on " + dayLabel + ". Your job: look at everything you know about this person " +
+      "and decide if there's something genuinely worth saying right now. " +
+      "Think like a sharp, caring friend — not a corporate assistant. " +
+      "Good reasons to message: an event coming up they should prep for, a goal they're slipping on, " +
+      "a task they said they'd do but haven't, something time-sensitive, a pattern worth naming, " +
+      "or a brief check-in that shows you're paying attention. " +
+      "A question is fine. A quick observation is fine. A heads-up is fine. " +
+      "If there is genuinely nothing useful to say — respond with exactly: NO_CHECKIN " +
+      "Max 2 sentences. Direct, warm, no fluff. Never start with 'I'. Don't be preachy.\n\n" +
+      "MEMORIES:\n" + allMemories + "\n\n" +
+      "TODAY'S EVENTS:\n" + (upcomingEvents || 'None scheduled.') + "\n\n" +
+      "REMINDERS TODAY:\n" + (upcomingToday || 'None.') + "\n\n" +
+      "PENDING TASKS:\n" + (pendingTasks || 'None.')
 
     try {
       const resp = await anthropic.messages.create({
@@ -2593,6 +2609,35 @@ async function checkEventReminders() {
         const notesPart = ev.notes ? '\n' + ev.notes : '';
         await bot.sendMessage(chatId, '30 min: ' + ev.title + locPart + notesPart).catch(() => {});
       }
+      // Post-event follow-up: 60-90 min after the event started
+      const endMins = ev.endTime ? (parseInt(ev.endTime.split(':')[0]) * 60 + parseInt(ev.endTime.split(':')[1])) : evMins + 60;
+      const minsSinceEnd = nowMins - endMins;
+      const followupKey = ev.id + '_followup';
+      if (minsSinceEnd >= 60 && minsSinceEnd <= 90 && !ud.warnedEvents[followupKey]) {
+        ud.warnedEvents[followupKey] = true;
+        changed = true;
+        await bot.sendMessage(chatId, 'How did ' + ev.title + ' go?').catch(() => {});
+      }
+    }
+    if (changed) saveUserData(chatId, ud);
+  }
+}
+
+async function checkFollowupNudges() {
+  const nowMs = Date.now();
+  for (const [chatId, ud] of Object.entries(userDataCache)) {
+    if (!Array.isArray(ud.pendingFollowUps) || !ud.pendingFollowUps.length) continue;
+    let changed = false;
+    for (const fu of ud.pendingFollowUps) {
+      if (fu.resolved || fu.nudgeSent) continue;
+      // Fire nudge when due_hours has elapsed
+      const dueMs = new Date(fu.createdAt || fu.date || 0).getTime() + (fu.due_hours || 24) * 3600000;
+      if (nowMs < dueMs) continue;
+      // Only nudge once
+      fu.nudgeSent = true;
+      changed = true;
+      const msg = 'Still need to ' + fu.text + '? Just checking — want me to set a reminder or help with it now?';
+      await bot.sendMessage(chatId, msg).catch(() => {});
     }
     if (changed) saveUserData(chatId, ud);
   }
@@ -2604,6 +2649,7 @@ setInterval(checkUpcomingDeadlines, 60 * 60 * 1000); // hourly: 3-day and 1-day 
 setInterval(sendMorningBriefings, 15 * 60 * 1000);   // every 15 min: 8 AM local briefing
 setInterval(sendWeeklyReview, 15 * 60 * 1000);        // every 15 min: Sunday 7 PM life review
 setInterval(sendProactiveCheckin, 30 * 60 * 1000);    // every 30 min: 10AM/2PM/6PM goal-aware nudge
+setInterval(checkFollowupNudges,  30 * 60 * 1000);    // every 30 min: nudge overdue tracked tasks
 
 // ---------- Webhook server (Vapi call outcomes) ----------
 // Vapi posts here when an outbound booking call finishes. We look up which
