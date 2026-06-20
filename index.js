@@ -375,6 +375,22 @@ const tools = [
     },
   },
   {
+    name: 'search_flights',
+    description: "Search for flights. Use whenever the user wants to fly somewhere, check flight prices, or plan travel. Generates pre-filled search links for Google Flights, Skyscanner, and Kayak. Handles one-way and return trips. Always save the trip to memory as a [goal] or [work] fact.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        origin: { type: 'string', description: 'Departure city or airport, e.g. Tbilisi, London, JFK.' },
+        destination: { type: 'string', description: 'Arrival city or airport, e.g. Dubai, Paris, LAX.' },
+        departure_date: { type: 'string', description: 'Departure date in YYYY-MM-DD format.' },
+        return_date: { type: 'string', description: 'Return date in YYYY-MM-DD format. Omit for one-way.' },
+        passengers: { type: 'integer', description: 'Number of passengers. Default 1.' },
+        cabin: { type: 'string', enum: ['economy', 'premium_economy', 'business', 'first'], description: 'Cabin class. Default economy.' },
+      },
+      required: ['origin', 'destination', 'departure_date'],
+    },
+  },
+  {
     name: 'save_address',
     description: 'Save a named address to the user\'s permanent address book (home, work, gym, sister\'s place, etc.). Use whenever the user mentions where someone or somewhere is — proactively, without being asked. Geocodes the address to lat/lon so rides can be booked later without asking again.',
     input_schema: {
@@ -694,6 +710,96 @@ function searchHotels(input) {
     booking_link: bookingUrl,
     airbnb_link: airbnbUrl,
     message: nights + '-night stay in ' + destination + ' for ' + guests + ' guest(s): Booking.com — ' + bookingUrl + ' | Airbnb — ' + airbnbUrl,
+  };
+}
+
+// ---------- Flight search (Google Flights, Skyscanner, Kayak) ----------
+function searchFlights(input) {
+  const { origin, destination, departure_date, return_date, passengers = 1, cabin = 'economy' } = input;
+
+  // IATA airport code lookup for clean URLs
+  const IATA = {
+    'tbilisi':'TBS','batumi':'BUS','kutaisi':'KUT',
+    'london':'LON','heathrow':'LHR','gatwick':'LGW','stansted':'STN',
+    'new york':'NYC','jfk':'JFK','laguardia':'LGA','newark':'EWR',
+    'los angeles':'LAX','chicago':'ORD','miami':'MIA','dallas':'DFW',
+    'dubai':'DXB','abu dhabi':'AUH','doha':'DOH','riyadh':'RUH',
+    'istanbul':'IST','ankara':'ESB','izmir':'ADB',
+    'paris':'CDG','lyon':'LYS','nice':'NCE','marseille':'MRS',
+    'frankfurt':'FRA','munich':'MUC','berlin':'BER','hamburg':'HAM',
+    'amsterdam':'AMS','brussels':'BRU','zurich':'ZRH','geneva':'GVA',
+    'madrid':'MAD','barcelona':'BCN','rome':'FCO','milan':'MXP',
+    'lisbon':'LIS','vienna':'VIE','prague':'PRG','warsaw':'WAW',
+    'budapest':'BUD','bucharest':'OTP','athens':'ATH','sofia':'SOF',
+    'kyiv':'KBP','minsk':'MSQ','riga':'RIX','tallinn':'TLL',
+    'vilnius':'VNO','yerevan':'EVN','baku':'GYD','tashkent':'TAS',
+    'moscow':'SVO','st petersburg':'LED','dubai':'DXB',
+    'cairo':'CAI','tel aviv':'TLV','amman':'AMM','beirut':'BEY',
+    'bangkok':'BKK','singapore':'SIN','hong kong':'HKG',
+    'tokyo':'NRT','osaka':'KIX','seoul':'ICN','beijing':'PEK',
+    'shanghai':'PVG','guangzhou':'CAN','kuala lumpur':'KUL',
+    'jakarta':'CGK','bali':'DPS','mumbai':'BOM','delhi':'DEL',
+    'sydney':'SYD','melbourne':'MEL','toronto':'YYZ','montreal':'YUL',
+    'mexico city':'MEX','bogota':'BOG','lima':'LIM','santiago':'SCL',
+    'sao paulo':'GRU','buenos aires':'EZE','casablanca':'CMN',
+    'nairobi':'NBO','johannesburg':'JNB','cape town':'CPT',
+    'copenhagen':'CPH','stockholm':'ARN','oslo':'OSL','helsinki':'HEL',
+  };
+
+  const getCode = (city) => {
+    const key = city.toLowerCase().trim();
+    return IATA[key] || city.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 3);
+  };
+
+  const fromCode = getCode(origin);
+  const toCode   = getCode(destination);
+  const dep      = departure_date;
+  const ret      = return_date || null;
+  const pax      = passengers || 1;
+
+  // Skyscanner uses YYMMDD in the path
+  const toSkyDate = (iso) => iso.replace(/-/g, '').slice(2); // 2025-07-20 -> 250720
+  const skyDep = toSkyDate(dep);
+  const skyRet = ret ? toSkyDate(ret) : null;
+
+  // Cabin class mapping
+  const cabinMap = { economy: 'economy', premium_economy: 'premiumeconomy', business: 'business', first: 'first' };
+  const skyClass = cabinMap[cabin] || 'economy';
+
+  // Google Flights — accepts city names directly
+  const tripType  = ret ? 'round trip' : 'one way';
+  const googleQ   = encodeURIComponent('flights from ' + origin + ' to ' + destination);
+  const googleUrl = 'https://www.google.com/travel/flights?q=' + googleQ;
+
+  // Skyscanner
+  let skyUrl = 'https://www.skyscanner.com/transport/flights/' + fromCode + '/' + toCode + '/' + skyDep + '/';
+  if (skyRet) skyUrl += skyRet + '/';
+  if (pax > 1 || skyClass !== 'economy') skyUrl += '?adults=' + pax + '&cabinclass=' + skyClass;
+
+  // Kayak
+  let kayakUrl = 'https://www.kayak.com/flights/' + fromCode + '-' + toCode + '/' + dep;
+  if (ret) kayakUrl += '/' + ret;
+  if (pax > 1) kayakUrl += '/' + pax + 'adults';
+
+  const legs = ret
+    ? origin + ' to ' + destination + ' on ' + dep + ', return ' + ret
+    : origin + ' to ' + destination + ' on ' + dep + ' (one-way)';
+
+  return {
+    ok: true,
+    origin, destination,
+    departure_date: dep,
+    return_date: ret,
+    passengers: pax,
+    cabin,
+    trip_type: tripType,
+    google_flights: googleUrl,
+    skyscanner: skyUrl,
+    kayak: kayakUrl,
+    message: legs + ' for ' + pax + ' passenger(s), ' + cabin + '.' +
+      ' Google Flights: ' + googleUrl +
+      ' | Skyscanner: ' + skyUrl +
+      ' | Kayak: ' + kayakUrl,
   };
 }
 
@@ -1033,6 +1139,7 @@ TOOLS:
 - book_ride: order a ride — returns Uber AND Bolt links, user picks their app. Resolves saved address labels (home, work, sister, etc.) automatically. Use for any ride/taxi request.
 - order_groceries: generate Wolt and Glovo links for grocery/food delivery. Takes a list of items and the user's city. User picks items in the app.
 - search_hotels: find hotels/Airbnbs — generates pre-filled Booking.com and Airbnb search links with dates, guests, destination. Use for any hotel or accommodation request.
+- search_flights: search flights on Google Flights, Skyscanner, and Kayak. Use for any travel/flying request. Handles one-way and return. Always save the trip to memory.
 - shop_online: search Amazon, AliExpress, Shein, eBay. Use for ANY online shopping request. Auto-picks best platforms by product type (electronics -> Amazon+AliExpress, fashion -> Shein+Amazon, etc). Returns direct search links per platform. Always note the user's budget if they mention one and save it to memory.
 - book_restaurant_online: ALWAYS try this first for restaurant bookings. Use web_search to find the restaurant on OpenTable or Resy, pass the URL here, get back a one-tap booking link the user can confirm immediately. No call needed.
 - make_booking_call: FALLBACK ONLY — use only when the restaurant is not found on OpenTable or Resy. Find the phone number via web_search first. Tell the user what you're about to do before calling.
@@ -1142,6 +1249,8 @@ async function callClaude(chatId, userText, wasVoice, username) {
           result = searchHotels(block.input);
         } else if (block.name === 'shop_online') {
           result = shopOnline(block.input);
+        } else if (block.name === 'search_flights') {
+          result = searchFlights(block.input);
         } else if (block.name === 'book_restaurant_online') {
           result = await bookRestaurantOnline(block.input);
           totalEventCounts.calls = (totalEventCounts.calls || 0) + 1;
