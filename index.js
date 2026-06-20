@@ -1396,6 +1396,9 @@ WHEN TO ASK A QUESTION:
 - If you can infer it, don't ask. If silence works, use silence.
 - Slip questions in naturally — mid-help, after a task, never as the opening line.
 
+VOICE REPLIES — KEEP THEM SHORT:
+When the user sent a voice message (wasVoice=true), your reply will be spoken aloud. Keep it under 3 sentences. Omit links, bullet lists, and markdown — none of those translate to speech. If there's more to share (search results, links), the system will send them as a text follow-up automatically.
+
 WHAT NEVER TO DO:
 - Never ask two questions in one message. Pick the better one.
 - Never ask obvious things you could infer. Use your brain.
@@ -1778,6 +1781,14 @@ async function synthesizeSpeech(text) {
     return { error: 'Voice replies are not configured (missing OPENAI_API_KEY).' };
   }
   try {
+    // OpenAI TTS hard limit is 4096 chars. Strip markdown noise and truncate.
+    const ttsInput = text
+      .replace(/\*\*/g, '').replace(/\*/g, '').replace(/#+ /g, '')
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1') // [label](url) -> label
+      .replace(/https?:\/\/\S+/g, '') // strip bare URLs (unreadable aloud)
+      .trim()
+      .slice(0, 4000); // leave a small buffer under the 4096 limit
+    if (!ttsInput) return { error: 'Nothing to speak after cleaning.' };
     const resp = await fetch('https://api.openai.com/v1/audio/speech', {
       method: 'POST',
       headers: {
@@ -1787,7 +1798,7 @@ async function synthesizeSpeech(text) {
       body: JSON.stringify({
         model: 'tts-1',
         voice: 'onyx',
-        input: text,
+        input: ttsInput,
       }),
     });
 
