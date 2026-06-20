@@ -452,7 +452,7 @@ async function makeBookingCall(chatId, args) {
           firstMessage: `Hi, I'm calling to book a table for ${args.party_size}, for ${args.date_time_description}.`,
           model: {
             provider: 'anthropic',
-            model: 'claude-haiku-3-5-20241022',
+            model: 'claude-3-5-haiku-20241022',
             messages: [{ role: 'system', content: systemPrompt }],
           },
           voice: { provider: 'playht', voiceId: 'jennifer' },
@@ -634,7 +634,7 @@ async function callClaude(chatId, userText, wasVoice, username) {
       i === tools.length - 1 ? { ...t, cache_control: { type: 'ephemeral' } } : t
     );
     const response = await anthropic.messages.create({
-      model: 'claude-haiku-3-5-20241022',
+      model: 'claude-3-5-haiku-20241022',
       max_tokens: 1024,
       system: systemBlocks,
       messages: userData.history,
