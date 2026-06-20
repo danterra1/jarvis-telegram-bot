@@ -307,6 +307,61 @@ const tools = [
   },
   {
     name: 'save_address',
+    description: "Save a named address to the user's permanent address book (home, work, gym, sister's place, etc.). Use whenever the user mentions where someone or somewhere is. Geocodes the address to lat/lon so rides can be booked later without asking again.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        label: { type: 'string', description: 'Short lowercase name: home, work, gym, sister, mom, airport, etc.' },
+        address: { type: 'string', description: 'Full street address including city and country if known.' },
+      },
+      required: ['label', 'address'],
+    },
+  },
+  {
+    name: 'book_ride',
+    description: "Order a ride for the user — returns both Uber and Bolt deep-links so user picks their preferred app. ALWAYS check savedAddresses first. 'Take me home' means look up label=home. If no dropoff is known, list their saved addresses and ask.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        dropoff_label: { type: 'string', description: 'Label of a saved address, e.g. home, work, sister.' },
+        dropoff_address: { type: 'string', description: 'Full address string if no saved label.' },
+        pickup_label: { type: 'string', description: 'Label of saved pickup address. Omit to use current GPS.' },
+        pickup_address: { type: 'string', description: 'Full pickup address if not using current location.' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'order_groceries',
+    description: "Generate grocery ordering links for Wolt and Glovo. Use when user wants to order groceries or food delivery. Takes a grocery list and their city (from saved location or memory) and returns one-tap links to grocery stores on both platforms. User picks the app they prefer.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        items: { type: 'array', items: { type: 'string' }, description: 'List of grocery items the user wants, e.g. ["milk", "bread", "eggs"].' },
+        city: { type: 'string', description: "User's city for finding nearby stores, e.g. Tbilisi, Warsaw." },
+        store_preference: { type: 'string', description: 'Specific store name if user mentioned one, optional.' },
+      },
+      required: ['city'],
+    },
+  },
+  {
+    name: 'search_hotels',
+    description: "Search for hotels and accommodations. Use when user asks to book or find a hotel, Airbnb, or place to stay. Generates pre-filled search links for Booking.com and Airbnb with dates, guests, and destination. User taps to browse and book.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        destination: { type: 'string', description: 'City or area to search, e.g. Paris, Batumi Georgia.' },
+        checkin_date: { type: 'string', description: 'Check-in date in YYYY-MM-DD format.' },
+        checkout_date: { type: 'string', description: 'Check-out date in YYYY-MM-DD format.' },
+        guests: { type: 'integer', description: 'Number of guests. Default 1.' },
+        rooms: { type: 'integer', description: 'Number of rooms. Default 1.' },
+        budget_per_night: { type: 'string', description: 'Budget hint e.g. budget, mid-range, luxury. Optional.' },
+      },
+      required: ['destination', 'checkin_date', 'checkout_date'],
+    },
+  },
+  {
+    name: 'save_address',
     description: 'Save a named address to the user\'s permanent address book (home, work, gym, sister\'s place, etc.). Use whenever the user mentions where someone or somewhere is — proactively, without being asked. Geocodes the address to lat/lon so rides can be booked later without asking again.',
     input_schema: {
       type: 'object',
@@ -540,16 +595,91 @@ async function bookRide(userData, input) {
     '&dropoff[latitude]=' + dropoff.lat +
     '&dropoff[longitude]=' + dropoff.lon;
 
-  // Also build a plain Google Maps directions link as backup
+  // ── Build Bolt deep-link ──────────────────────────────────────────────────
+  const boltLink = 'https://bolt.eu/en/ride/' +
+    '?dropoff_lat=' + dropoff.lat +
+    '&dropoff_lng=' + dropoff.lon +
+    '&dropoff_name=' + encodeURIComponent(dropoff.formatted);
+
+  // ── Google Maps backup ────────────────────────────────────────────────────
   const mapsLink = 'https://www.google.com/maps/dir/?api=1&destination=' +
     encodeURIComponent(dropoff.formatted);
 
   return {
     ok: true,
     uber_link: uberLink,
+    bolt_link: boltLink,
     maps_link: mapsLink,
     dropoff: dropoff.formatted,
-    message: 'Uber link ready for ' + dropoff.formatted + '. User taps to open Uber app and confirm once. Note: full ride confirmation requires Uber for Business — the user sees the trip request in the app.',
+    message: 'Ride links ready for ' + dropoff.formatted + ': Uber — ' + uberLink + ' | Bolt — ' + boltLink,
+  };
+}
+
+// ---------- Order groceries (Wolt + Glovo deep-links) ----------
+async function orderGroceries(userData, input) {
+  const { items, city, store_preference } = input;
+  const resolvedCity = city || userData.locationPlace || 'your city';
+
+  const listText = (items && items.length) ? items.join(', ') : '';
+  const storeQuery = store_preference ? encodeURIComponent(store_preference) : 'grocery';
+  const cityEncoded = encodeURIComponent(resolvedCity);
+
+  // Wolt — search for grocery stores in the city
+  const woltLink = 'https://wolt.com/en/discovery?q=' + storeQuery + '&location=' + cityEncoded;
+
+  // Glovo — search link
+  const glovoLink = 'https://glovoapp.com/en/search/?search=' + storeQuery;
+
+  let msg = 'Here are your grocery links for ' + resolvedCity + ':';
+  if (listText) msg += ' Items to get: ' + listText + '.';
+
+  return {
+    ok: true,
+    wolt_link: woltLink,
+    glovo_link: glovoLink,
+    items: items || [],
+    city: resolvedCity,
+    message: msg + ' Wolt: ' + woltLink + ' | Glovo: ' + glovoLink,
+    note: 'User selects items in the app. No public consumer API exists for Wolt or Glovo automated ordering.',
+  };
+}
+
+// ---------- Search hotels (Booking.com + Airbnb pre-filled links) ----------
+function searchHotels(input) {
+  const { destination, checkin_date, checkout_date, guests = 1, rooms = 1, budget_per_night } = input;
+
+  const destEncoded = encodeURIComponent(destination);
+
+  // Booking.com pre-filled search
+  let bookingUrl = 'https://www.booking.com/searchresults.html' +
+    '?ss=' + destEncoded +
+    '&checkin=' + checkin_date +
+    '&checkout=' + checkout_date +
+    '&group_adults=' + guests +
+    '&no_rooms=' + rooms +
+    '&order=popularity';
+  if (budget_per_night === 'budget') bookingUrl += '&nflt=price%3DEUR-0-80-1';
+  if (budget_per_night === 'luxury') bookingUrl += '&nflt=price%3DEUR-200-10000-1';
+
+  // Airbnb pre-filled search
+  const airbnbUrl = 'https://www.airbnb.com/s/' + destEncoded + '/homes' +
+    '?checkin=' + checkin_date +
+    '&checkout=' + checkout_date +
+    '&adults=' + guests;
+
+  // Nights count
+  const nights = Math.round((new Date(checkout_date) - new Date(checkin_date)) / 86400000);
+
+  return {
+    ok: true,
+    destination,
+    checkin: checkin_date,
+    checkout: checkout_date,
+    nights,
+    guests,
+    booking_link: bookingUrl,
+    airbnb_link: airbnbUrl,
+    message: nights + '-night stay in ' + destination + ' for ' + guests + ' guest(s): Booking.com — ' + bookingUrl + ' | Airbnb — ' + airbnbUrl,
   };
 }
 
@@ -839,6 +969,9 @@ TOOLS:
 - save_address: save any named address to permanent address book — home, work, gym, family members' places, etc. Use whenever the user mentions where someone or somewhere is. Geocodes and stores coordinates automatically.
 - book_ride: order an Uber using saved addresses. Use when user wants a ride anywhere. Resolves saved labels (e.g. "take me home" → looks up saved "home" address) and generates a pre-filled Uber deep-link. User taps once in the Uber app to confirm. Always check savedAddresses first before asking for an address.
 - set_reminder: convert any relative time to exact ISO datetime using their saved timezone. For yearly events (birthdays, anniversaries) set recurrence and is_gift_occasion.
+- book_ride: order a ride — returns Uber AND Bolt links, user picks their app. Resolves saved address labels (home, work, sister, etc.) automatically. Use for any ride/taxi request.
+- order_groceries: generate Wolt and Glovo links for grocery/food delivery. Takes a list of items and the user's city. User picks items in the app.
+- search_hotels: find hotels/Airbnbs — generates pre-filled Booking.com and Airbnb search links with dates, guests, destination. Use for any hotel or accommodation request.
 - book_restaurant_online: ALWAYS try this first for restaurant bookings. Use web_search to find the restaurant on OpenTable or Resy, pass the URL here, get back a one-tap booking link the user can confirm immediately. No call needed.
 - make_booking_call: FALLBACK ONLY — use only when the restaurant is not found on OpenTable or Resy. Find the phone number via web_search first. Tell the user what you're about to do before calling.
 - remember_fact / recall_memory / forget_fact: your memory tools — use constantly.
@@ -941,6 +1074,10 @@ async function callClaude(chatId, userText, wasVoice, username) {
           saveUserData(chatId, userData);
         } else if (block.name === 'book_ride') {
           result = await bookRide(userData, block.input);
+        } else if (block.name === 'order_groceries') {
+          result = await orderGroceries(userData, block.input);
+        } else if (block.name === 'search_hotels') {
+          result = searchHotels(block.input);
         } else if (block.name === 'book_restaurant_online') {
           result = await bookRestaurantOnline(block.input);
           totalEventCounts.calls = (totalEventCounts.calls || 0) + 1;
