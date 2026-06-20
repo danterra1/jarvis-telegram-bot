@@ -2010,7 +2010,7 @@ bot.on('message', async (msg) => {
       };
 
       // Build a fresh message array (do not push raw image to persistent history — too large)
-      const historyForVision = userData.history.slice(-10);   // last 10 turns for context
+      const historyForVision = sanitizeHistory(userData.history.slice(-10));   // last 10 turns, sanitized
       const messagesForVision = [...historyForVision, imageMessage];
 
       let visionResult;
@@ -2019,8 +2019,8 @@ bot.on('message', async (msg) => {
       while (attempts < maxAttempts) {
         attempts++;
         const vResp = await anthropic.messages.create({
-          model: MODEL,
-          max_tokens: 800,
+          model: 'claude-sonnet-4-5',
+          max_tokens: 1500,
           system: systemPrompt,
           messages: messagesForVision,
           tools,
@@ -2032,10 +2032,27 @@ bot.on('message', async (msg) => {
           const toolResults = [];
           for (const tb of toolBlocks) {
             let res;
-            if (tb.name === 'remember_fact')   { res = addMemory(userData, tb.input.text, tb.input.category); saveUserData(chatId, userData); }
-            else if (tb.name === 'forget_fact') { res = removeMemory(userData, tb.input.text); saveUserData(chatId, userData); }
-            else if (tb.name === 'web_search')  { res = await webSearch(tb.input.query); }
-            else                                { res = { error: 'Tool not available for image analysis' }; }
+            if (tb.name === 'remember_fact') {
+              res = addMemory(userData, tb.input.text, tb.input.category); saveUserData(chatId, userData);
+            } else if (tb.name === 'forget_fact') {
+              res = removeMemory(userData, tb.input.text); saveUserData(chatId, userData);
+            } else if (tb.name === 'web_search') {
+              res = await webSearch(tb.input.query);
+            } else if (tb.name === 'track_person') {
+              if (!Array.isArray(userData.people)) userData.people = [];
+              const { name, relationship, notes, reach_out_days } = tb.input;
+              const ex = userData.people.find(pp => pp.name.toLowerCase() === (name||'').toLowerCase());
+              if (ex) { if (relationship) ex.relationship=relationship; if (notes) ex.notes=(ex.notes?ex.notes+' | ':'')+notes; ex.lastMentioned=new Date().toISOString(); }
+              else { userData.people.push({ name, relationship:relationship||'contact', notes:notes||'', reach_out_days:reach_out_days||null, lastMentioned:new Date().toISOString(), addedAt:new Date().toISOString() }); }
+              saveUserData(chatId, userData); res = { ok: true, name };
+            } else if (tb.name === 'track_followup') {
+              if (!Array.isArray(userData.pendingFollowUps)) userData.pendingFollowUps = [];
+              const due = tb.input.due_date || new Date(Date.now()+86400000*3).toISOString().slice(0,10);
+              userData.pendingFollowUps.push({ id: Date.now().toString(), text: tb.input.text, dueDate: due, resolved: false, createdAt: new Date().toISOString() });
+              saveUserData(chatId, userData); res = { ok: true };
+            } else {
+              res = { error: 'Tool not available in image analysis context' };
+            }
             toolResults.push({ type: 'tool_result', tool_use_id: tb.id, content: JSON.stringify(res) });
           }
           messagesForVision.push({ role: 'assistant', content: vResp.content });
