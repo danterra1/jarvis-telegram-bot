@@ -421,6 +421,60 @@ function extractUrls(text) {
   return [...new Set(cleaned)];
 }
 
+// ---------- Online restaurant booking (OpenTable / Resy deep-link) ----------
+async function bookRestaurantOnline(input) {
+  const { business_name, location, date_time_iso, party_size, reservation_name, opentable_url, resy_url } = input;
+
+  let dt;
+  try { dt = new Date(date_time_iso); } catch(_) { dt = new Date(); }
+  const dateStr = dt.toISOString().slice(0, 10);
+  const timeStr = dt.toTimeString().slice(0, 5);
+
+  // Try OpenTable
+  if (opentable_url && opentable_url.includes('opentable.com')) {
+    const ridMatch = opentable_url.match(/[?&]rid=(\d+)/) || opentable_url.match(/\/(\d+)(?:\?|$)/);
+    const slugMatch = opentable_url.match(/opentable\.com\/r\/([^?#\/]+)/);
+    let bookingLink;
+    if (ridMatch) {
+      bookingLink = 'https://www.opentable.com/booking/experiences-availability?rid=' + ridMatch[1] + '&covers=' + party_size + '&datetime=' + dateStr + 'T' + timeStr;
+    } else if (slugMatch) {
+      bookingLink = 'https://www.opentable.com/r/' + slugMatch[1] + '?covers=' + party_size + '&dateTime=' + dateStr + 'T' + timeStr;
+    } else {
+      bookingLink = opentable_url.split('?')[0] + '?covers=' + party_size + '&dateTime=' + dateStr + 'T' + timeStr;
+    }
+    return {
+      ok: true,
+      platform: 'OpenTable',
+      booking_link: bookingLink,
+      message: 'Found on OpenTable. Send this booking link to the user — they tap once to confirm ' + party_size + ' people on ' + dateStr + ' at ' + timeStr + ' under "' + reservation_name + '": ' + bookingLink,
+    };
+  }
+
+  // Try Resy
+  if (resy_url && resy_url.includes('resy.com')) {
+    const slugMatch = resy_url.match(/resy\.com\/cities\/([^/]+)\/([^?#/]+)/);
+    let bookingLink;
+    if (slugMatch) {
+      bookingLink = 'https://resy.com/cities/' + slugMatch[1] + '/' + slugMatch[2] + '?date=' + dateStr + '&seats=' + party_size;
+    } else {
+      bookingLink = resy_url.split('?')[0] + '?date=' + dateStr + '&seats=' + party_size;
+    }
+    return {
+      ok: true,
+      platform: 'Resy',
+      booking_link: bookingLink,
+      message: 'Found on Resy. Send this booking link to the user — they tap once to confirm ' + party_size + ' people on ' + dateStr + ' at ' + timeStr + ': ' + bookingLink,
+    };
+  }
+
+  // Not on any known platform — fall back to phone call
+  return {
+    ok: false,
+    message: business_name + ' was not found on OpenTable or Resy. Use make_booking_call with the restaurant phone number instead.',
+    fallback: 'make_booking_call',
+  };
+}
+
 // ---------- Outbound booking calls (Vapi) ----------
 // Tracks in-flight Vapi calls so the webhook callback knows which Telegram
 // chat to report the outcome back to. Kept in memory + persisted to disk so
