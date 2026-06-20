@@ -583,6 +583,7 @@ async function callClaude(chatId, userText, wasVoice) {
   // typing out a literal link.
   const searchResultsThisTurn = [];
   let totalAnthropicTokens = 0;
+  let totalEventCounts = {};
 
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
     const response = await anthropic.messages.create({
@@ -614,6 +615,7 @@ async function callClaude(chatId, userText, wasVoice) {
           result = await webSearch(block.input.query);
           if (result && !result.error && result.results) {
             searchResultsThisTurn.push(...result.results);
+            if (!totalEventCounts) totalEventCounts = {}; totalEventCounts.searches = (totalEventCounts.searches || 0) + 1;
           }
         } else if (block.name === 'request_location') {
           await sendLocationRequest(chatId, block.input.reason, wasVoice);
@@ -622,9 +624,11 @@ async function callClaude(chatId, userText, wasVoice) {
           result = { ok: true, note: 'Location request button sent to the user. Tell them you sent it and to tap it.' };
         } else if (block.name === 'set_reminder') {
           result = setReminder(userData, block.input.text, block.input.when_iso, block.input.recurrence, block.input.is_gift_occasion);
+          totalEventCounts.reminders = (totalEventCounts.reminders || 0) + 1;
           saveUserData(chatId, userData);
         } else if (block.name === 'make_booking_call') {
           result = await makeBookingCall(chatId, block.input);
+          totalEventCounts.calls = (totalEventCounts.calls || 0) + 1;
         } else {
           result = { error: 'Unknown tool' };
         }
@@ -644,11 +648,11 @@ async function callClaude(chatId, userText, wasVoice) {
     const reply = textBlock ? textBlock.text : "Sorry, I didn't get a usable reply back.";
     userData.history.push({ role: 'assistant', content: reply });
     saveUserData(chatId, userData);
-    return { reply, searchResults: searchResultsThisTurn, anthropicTokens: totalAnthropicTokens };
+    return { reply, searchResults: searchResultsThisTurn, anthropicTokens: totalAnthropicTokens, eventCounts: totalEventCounts };
   }
 
   saveUserData(chatId, userData);
-  return { reply: "I got stuck looping on tool calls — try asking again.", searchResults: searchResultsThisTurn, anthropicTokens: totalAnthropicTokens };
+  return { reply: "I got stuck looping on tool calls — try asking again.", searchResults: searchResultsThisTurn, anthropicTokens: totalAnthropicTokens, eventCounts: totalEventCounts };
 }
 
 // ---------- Voice transcription (OpenAI Whisper) ----------
@@ -857,8 +861,8 @@ bot.on('message', async (msg) => {
   bot.sendChatAction(chatId, wasVoice ? 'record_voice' : 'typing');
 
   try {
-    const { reply, searchResults, anthropicTokens: at1 } = await callClaude(chatId, text, wasVoice);
-    reportUsage(msg.from?.username, at1 || 0, 0);
+    const { reply, searchResults, anthropicTokens: at1, eventCounts: ec1 } = await callClaude(chatId, text, wasVoice);
+    reportUsage(msg.from?.username, at1 || 0, 0, { ...ec1, messages: 1, voice: wasVoice ? 1 : 0 });
     await sendReply(chatId, reply, wasVoice, searchResults);
   } catch (err) {
     console.error('Error handling message:', err);
@@ -1035,13 +1039,13 @@ webhookServer.listen(WEBHOOK_PORT, () => {
 
 // ---------- One-time migration: register existing users in admin panel ----------
 
-async function reportUsage(username, anthropicTokens, openaiTokens) {
-  if (!username || (!anthropicTokens && !openaiTokens)) return;
+async function reportUsage(username, anthropicTokens, openaiTokens, events = {}) {
+  if (!username) return;
   try {
     await fetch('https://c79b1d1c-b690-42a4-89c1-7aa003a55a66-00-3gtw2r50e421s.pike.replit.dev/api/bot/usage', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ telegram_username: username, anthropic_tokens: anthropicTokens, openai_tokens: openaiTokens })
+      body: JSON.stringify({ telegram_username: username, anthropic_tokens: anthropicTokens, openai_tokens: openaiTokens, events })
     });
   } catch (_) {}
 }
