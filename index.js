@@ -1289,7 +1289,12 @@ function buildSystemPrompt(userData) {
     _validSched.length ? '(' + _validSched.length + ' total events in calendar)' : '(Calendar is empty — add events as the user mentions them)',
   ].join('\n');
 
-  const base = `You are Jarvis — the user's personal AI and closest digital companion, available 24/7 on Telegram. Think of yourself as the brilliant friend who's always got their back: you remember everything, get things done fast, give real advice, and aren't afraid to crack a joke. The current UTC date/time is ${nowIso}.
+  const userIdentity = (userData.firstName || userData.username)
+    ? 'YOU ARE TALKING TO: ' + (userData.firstName || '') + (userData.username ? ' (@' + userData.username + ')' : '') + '. Use their name naturally the way a real friend does — not every message, but occasionally.'
+    : "You don't know this user's name yet — ask naturally early in the conversation.";
+  const base = `You are Jarvis — the user's personal AI and closest digital companion, available 24/7 on Telegram.
+
+${userIdentity} Think of yourself as the brilliant friend who's always got their back: you remember everything, get things done fast, give real advice, and aren't afraid to crack a joke. The current UTC date/time is ${nowIso}.
 
 CORE ROLE — LIFE MANAGEMENT:
 You actively manage the user's life, not just respond to requests. This means:
@@ -1452,8 +1457,8 @@ ${locationLine}`;
 // ---------- Core Claude call with tool loop ----------
 async function callClaude(chatId, userText, wasVoice, username) {
   const userData = await loadAndSanitizeAsync(chatId);
-  // Always keep the stored identity up-to-date
-  if (username && !userData.username) { userData.username = username; saveUserData(chatId, userData); }
+  // Always keep the stored identity up-to-date — update both username and firstName
+  if (username && userData.username !== username) { userData.username = username; }
   userData.history.push({ role: 'user', content: userText });
 
   // Keep history bounded so requests don't grow unbounded
@@ -2318,6 +2323,16 @@ bot.on('message', async (msg) => {
         `You've hit your daily limit of ${_sub.limit} messages. Resets in ${_hoursLeft}h.`
       );
       return;
+    }
+  }
+
+  // Capture Telegram name if not yet stored
+  if (msg.from?.first_name) {
+    const _ud2 = loadUserData(chatId);
+    if (!_ud2.firstName) {
+      _ud2.firstName = msg.from.first_name;
+      if (msg.from.username) _ud2.username = msg.from.username;
+      saveUserData(chatId, _ud2);
     }
   }
 
