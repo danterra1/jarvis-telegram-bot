@@ -63,6 +63,7 @@ function loadUserData(chatId) {
       if (typeof data.locationUtcOffset === 'undefined') data.locationUtcOffset = 0;
       if (typeof data.locationTimezone === 'undefined') data.locationTimezone = 'UTC';
       if (typeof data.lastWeeklyReview === 'undefined') data.lastWeeklyReview = '';
+      if (typeof data.checkinSlots === 'undefined') data.checkinSlots = {};
       if (!Array.isArray(data.history)) data.history = [];
       if (!Array.isArray(data.reminders)) data.reminders = [];
       data.version = DATA_VERSION;
@@ -573,11 +574,22 @@ You have a durable long-term memory store (saved to disk, persists forever). Cat
 - Before answering anything about them, call recall_memory if you're not sure you have everything — your visible list is just a fast-access subset, not the full store.
 - Group and organize: use the right category. Project details go in [project], health updates in [health], financial goals in [finance], recurring behaviors in [habit].
 
-PROACTIVE MANAGEMENT:
-- If you notice a gap (a deadline without a reminder, a goal without a plan, a project that hasn't been mentioned in a while), bring it up naturally.
-- When they complete something, celebrate briefly and update the memory.
-- If they're stressed or overwhelmed, offer to help organize and prioritize — don't just answer the surface question.
-- Spot conflicts: if they have two things at the same time, flag it.
+PROACTIVE MANAGEMENT — THIS IS YOUR MOST IMPORTANT FUNCTION:
+Before you answer ANY request, run it through the user's known goals, finances, health plans, and habits. If there's a conflict or a risk, flag it naturally WHILE still helping — don't refuse, don't lecture, just be honest like a friend who's also their manager.
+
+Examples of how to handle conflicts:
+- They're saving money + ask for party spots → "Here are some options — worth noting you mentioned cutting back on spending this month. A few of these are pricey, so flagging that. Still want the full list?"
+- They have a health goal + ask for fast food recs → "Sure — these are the best ones nearby. You did say you're trying to eat cleaner though, so just flagging it. Want me to also pull some healthier spots to compare?"
+- They have a deadline tomorrow + they're asking about movies → "Happy to help — just a heads up, you've got [deadline] tomorrow. Handled? Or want me to help you plan the evening around it?"
+- They said they'd call someone last week → "By the way — you mentioned reaching out to [person]. Did that happen? Want me to set a reminder?"
+
+More proactive behaviors:
+- When you notice a gap (goal without a plan, project without a reminder, deadline approaching), bring it up organically — even mid-conversation.
+- When they complete something, note it briefly and update memory.
+- If they seem stressed or scattered, offer to help them prioritize. Don't just answer the surface question.
+- Track follow-ups: if they said they'd do something, check back later.
+- Notice patterns: if they keep pushing the same thing off, gently name it.
+- Suggest automations: if they keep asking you to remind them about the same type of thing, offer to set a recurring reminder.
 
 COMMUNICATION STYLE:
 - Telegram texting style: concise, warm, direct. Like a smart friend who also happens to be incredibly organized.
@@ -1272,10 +1284,112 @@ async function sendWeeklyReview() {
   }
 }
 
+
+// ─── Proactive: mid-day check-ins ────────────────────────────────────────────
+// Runs every 30 min. At 10 AM, 2 PM, and 6 PM local time, Claude reviews the
+// user's life context and fires a proactive nudge IF there's something worth
+// saying. Not every slot produces a message — Claude decides based on context.
+async function sendProactiveCheckin() {
+  let files;
+  try {
+    files = fs.readdirSync(DATA_DIR).filter(
+      (f) => f.startsWith('user_') && f.endsWith('.json') && !f.includes('.corrupt-') && !f.endsWith('.tmp')
+    );
+  } catch (_) { return; }
+
+  const CHECKIN_HOURS = [10, 14, 18]; // 10 AM, 2 PM, 6 PM local
+
+  for (const file of files) {
+    const chatId = file.slice('user_'.length, -'.json'.length);
+    let userData;
+    try {
+      userData = JSON.parse(fs.readFileSync(path.join(DATA_DIR, file), 'utf8'));
+    } catch (_) { continue; }
+
+    // Need real life context to check in meaningfully
+    if (!userData.memories || userData.memories.length < 3) continue;
+
+    const utcOffsetHrs = userData.locationUtcOffset || 0;
+    const nowUtc = new Date();
+    const localMs = nowUtc.getTime() + utcOffsetHrs * 3600000;
+    const localDate = new Date(localMs);
+    const localHour = localDate.getUTCHours();
+    const localMin = localDate.getUTCMinutes();
+
+    // Only fire in the 30-min window after each check-in hour
+    if (!CHECKIN_HOURS.includes(localHour) || localMin >= 30) continue;
+
+    // Only once per check-in slot per day
+    const slotKey = localDate.toISOString().slice(0, 10) + '_h' + localHour;
+    if (!userData.checkinSlots) userData.checkinSlots = {};
+    if (userData.checkinSlots[slotKey]) continue;
+
+    userData.checkinSlots[slotKey] = true;
+    // Clean old slot keys (keep last 10)
+    const keys = Object.keys(userData.checkinSlots).sort();
+    if (keys.length > 10) keys.slice(0, keys.length - 10).forEach(k => delete userData.checkinSlots[k]);
+    saveUserData(chatId, userData);
+
+    // Build life snapshot
+    const allMemories = (userData.memories || [])
+      .sort((a, b) => (b.updatedAt || b.date).localeCompare(a.updatedAt || a.date))
+      .slice(0, 30)
+      .map(m => '[' + m.category + '] ' + m.text)
+      .join('
+');
+
+    const upcomingToday = (userData.reminders || [])
+      .filter(r => {
+        const t = new Date(r.when).getTime();
+        const endOfDay = localMs + 24 * 3600000;
+        return t >= localMs && t <= endOfDay;
+      })
+      .map(r => '- ' + r.text + ' at ' + new Date(r.when).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }))
+      .join('
+');
+
+    const timeOfDay = localHour < 12 ? 'morning' : localHour < 17 ? 'afternoon' : 'evening';
+    const dayLabel = localDate.toLocaleDateString('en-US', { weekday: 'long' });
+
+    const checkinPrompt =
+      'You are Jarvis, the user's personal life manager. It's ' + timeOfDay + ' on ' + dayLabel + '. ' +
+      'Review everything you know about them below and decide: is there anything worth proactively saying right now? ' +
+      'This could be: a deadline or reminder coming up today they should prep for, a goal they're drifting from, ' +
+      'a habit they should be doing right now, a follow-up they mentioned but haven't done, ' +
+      'something time-sensitive in their work or finances, or a useful nudge based on the time of day. ' +
+      'IMPORTANT: Only send a message if there is genuinely something useful to say. ' +
+      'If everything looks fine and there's nothing actionable, respond with exactly: NO_CHECKIN ' +
+      'Keep the message short (2-3 sentences max). Conversational, not preachy. Like a smart manager checking in briefly.
+
+' +
+      'THEIR LIFE CONTEXT:
+' + allMemories + '
+
+' +
+      'TODAY'S REMAINING REMINDERS:
+' + (upcomingToday || 'None.');
+
+    try {
+      const resp = await anthropic.messages.create({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 180,
+        messages: [{ role: 'user', content: checkinPrompt }],
+      });
+      const text = resp.content.find(b => b.type === 'text')?.text?.trim();
+      if (text && text !== 'NO_CHECKIN' && !text.startsWith('NO_CHECKIN')) {
+        await bot.sendMessage(chatId, text);
+      }
+    } catch (err) {
+      console.error('[checkin] chatId', chatId, err.message);
+    }
+  }
+}
+
 setInterval(checkReminders, 60 * 1000);
 setInterval(checkUpcomingDeadlines, 60 * 60 * 1000); // hourly: 3-day and 1-day warnings
 setInterval(sendMorningBriefings, 15 * 60 * 1000);   // every 15 min: 8 AM local briefing
 setInterval(sendWeeklyReview, 15 * 60 * 1000);        // every 15 min: Sunday 7 PM life review
+setInterval(sendProactiveCheckin, 30 * 60 * 1000);    // every 30 min: 10AM/2PM/6PM goal-aware nudge
 
 // ---------- Webhook server (Vapi call outcomes) ----------
 // Vapi posts here when an outbound booking call finishes. We look up which
