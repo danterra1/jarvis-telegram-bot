@@ -45,8 +45,8 @@ function userFile(chatId) {
 // Bump this if the on-disk shape ever changes incompatibly.
 const DATA_VERSION = 2;
 
-function emptyUserData() {
-  return { version: DATA_VERSION, memories: [], history: [], reminders: [] };
+function emptyUserData(username, firstName) {
+  return { version: DATA_VERSION, memories: [], history: [], reminders: [], username: username || '', firstName: firstName || '' };
 }
 
 function loadUserData(chatId) {
@@ -57,6 +57,8 @@ function loadUserData(chatId) {
       // Backfill defaults for older files / partial writes so the rest of
       // the code never has to null-check these.
       if (!Array.isArray(data.memories)) data.memories = [];
+      if (typeof data.username === 'undefined') data.username = '';
+      if (typeof data.firstName === 'undefined') data.firstName = '';
       if (!Array.isArray(data.history)) data.history = [];
       if (!Array.isArray(data.reminders)) data.reminders = [];
       data.version = DATA_VERSION;
@@ -565,8 +567,10 @@ You also have web_search — use it whenever the user asks for recommendations, 
 }
 
 // ---------- Core Claude call with tool loop ----------
-async function callClaude(chatId, userText, wasVoice) {
+async function callClaude(chatId, userText, wasVoice, username) {
   const userData = loadUserData(chatId);
+  // Always keep the stored identity up-to-date
+  if (username && !userData.username) { userData.username = username; saveUserData(chatId, userData); }
   userData.history.push({ role: 'user', content: userText });
 
   // Keep history bounded so requests don't grow unbounded
@@ -861,7 +865,7 @@ bot.on('message', async (msg) => {
   bot.sendChatAction(chatId, wasVoice ? 'record_voice' : 'typing');
 
   try {
-    const { reply, searchResults, anthropicTokens: at1, eventCounts: ec1 } = await callClaude(chatId, text, wasVoice);
+    const { reply, searchResults, anthropicTokens: at1, eventCounts: ec1 } = await callClaude(chatId, text, wasVoice, msg.from?.username || '');
     reportUsage(msg.from?.username, at1 || 0, 0, { ...ec1, messages: 1, voice: wasVoice ? 1 : 0 });
     await sendReply(chatId, reply, wasVoice, searchResults);
   } catch (err) {
@@ -1059,21 +1063,45 @@ async function migrateExistingUsers() {
     );
   } catch (e) { return; }
 
-  console.log('[migrate] Found', files.length, 'existing users to sync...');
+  console.log('[migrate] Found', files.length, 'user files to sync...');
+  let synced = 0;
+  let skipped = 0;
   for (const file of files) {
     const chatId = file.slice('user_'.length, -'.json'.length);
     try {
-      const chat = await bot.getChat(chatId);
-      if (chat.username) {
-        await registerWithJarvis(chat.username, chat.first_name || '');
-        console.log('[migrate] Synced @' + chat.username);
+      // Read stored identity directly from file — no Telegram API call needed
+      let username = '';
+      let firstName = '';
+      try {
+        const raw = JSON.parse(fs.readFileSync(path.join(DATA_DIR, file), 'utf8'));
+        username = raw.username || '';
+        firstName = raw.firstName || '';
+      } catch (_) {}
+
+      // Fall back to Telegram API only if file has no identity stored
+      if (!username && !firstName) {
+        try {
+          const chat = await bot.getChat(chatId);
+          username = chat.username || '';
+          firstName = chat.first_name || '';
+          await new Promise(r => setTimeout(r, 300)); // rate limit only when needed
+        } catch (_) {}
+      }
+
+      if (username || firstName) {
+        await registerWithJarvis(username, firstName);
+        const label = username ? '@' + username : firstName;
+        console.log('[migrate] Synced', label, '(chatId=' + chatId + ')');
+        synced++;
+      } else {
+        skipped++;
       }
     } catch (e) {
-      console.warn('[migrate] Skipped chatId', chatId, e.message);
+      console.warn('[migrate] Error for chatId', chatId, e.message);
+      skipped++;
     }
-    await new Promise(r => setTimeout(r, 300)); // avoid Telegram rate limits
   }
-  console.log('[migrate] Done.');
+  console.log('[migrate] Done. Synced:', synced, 'Skipped:', skipped);
 }
 migrateExistingUsers();
 
