@@ -1159,7 +1159,8 @@ async function sendLocationRequest(chatId, reason, alsoSpeak) {
       reason ? `I need your location to ${reason}. I've sent you a button to tap.` : "I need your location. I've sent you a button to tap."
     );
     if (speech.ok) {
-      bot.sendVoice(chatId, speech.buffer, {}, { filename: 'reply.mp3', contentType: 'audio/mpeg' });
+      bot.sendVoice(chatId, speech.buffer, {}, { filename: 'reply.mp3', contentType: 'audio/mpeg' })
+        .catch(() => {}); // user may have voice restricted — silently skip
     }
   }
 }
@@ -1792,9 +1793,15 @@ async function sendReply(chatId, reply, wasVoice, searchResults) {
   // Voice in -> voice out.
   const speech = await synthesizeSpeech(reply);
   if (speech.ok) {
-    await bot.sendVoice(chatId, speech.buffer, {}, { filename: 'reply.mp3', contentType: 'audio/mpeg' });
+    try {
+      await bot.sendVoice(chatId, speech.buffer, {}, { filename: 'reply.mp3', contentType: 'audio/mpeg' });
+    } catch (_voiceErr) {
+      // User has voice messages restricted in Telegram privacy settings — fall back to text
+      await bot.sendMessage(chatId, reply);
+      return;
+    }
   } else {
-    // Fall back to text if TTS fails, so the user still gets the answer.
+    // Fall back to text if TTS synthesis fails.
     await bot.sendMessage(chatId, reply);
     return;
   }
