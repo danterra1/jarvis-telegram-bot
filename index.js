@@ -733,7 +733,7 @@ function searchFlights(input) {
     'budapest':'BUD','bucharest':'OTP','athens':'ATH','sofia':'SOF',
     'kyiv':'KBP','minsk':'MSQ','riga':'RIX','tallinn':'TLL',
     'vilnius':'VNO','yerevan':'EVN','baku':'GYD','tashkent':'TAS',
-    'moscow':'SVO','st petersburg':'LED','dubai':'DXB',
+    'moscow':'SVO','st petersburg':'LED',
     'cairo':'CAI','tel aviv':'TLV','amman':'AMM','beirut':'BEY',
     'bangkok':'BKK','singapore':'SIN','hong kong':'HKG',
     'tokyo':'NRT','osaka':'KIX','seoul':'ICN','beijing':'PEK',
@@ -958,7 +958,7 @@ async function makeBookingCall(chatId, args) {
           firstMessage: `Hi, I'm calling to book a table for ${args.party_size}, for ${args.date_time_description}.`,
           model: {
             provider: 'anthropic',
-            model: 'claude-sonnet-4-6',
+            model: 'claude-sonnet-4-5',
             messages: [{ role: 'system', content: systemPrompt }],
           },
           voice: { provider: 'playht', voiceId: 'jennifer' },
@@ -1199,7 +1199,7 @@ async function callClaude(chatId, userText, wasVoice, username) {
 
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: 'claude-sonnet-4-5',
       max_tokens: 600,
       system: buildSystemPrompt(userData),
       messages: userData.history,
@@ -1753,7 +1753,7 @@ async function sendMorningBriefings() {
 
     try {
       const resp = await anthropic.messages.create({
-        model: 'claude-sonnet-4-6',
+        model: 'claude-sonnet-4-5',
         max_tokens: 400,
         messages: [{ role: 'user', content: briefingPrompt }],
       });
@@ -1827,7 +1827,7 @@ async function sendWeeklyReview() {
 
     try {
       const resp = await anthropic.messages.create({
-        model: 'claude-sonnet-4-6',
+        model: 'claude-sonnet-4-5',
         max_tokens: 450,
         messages: [{ role: 'user', content: reviewPrompt }],
       });
@@ -1918,7 +1918,7 @@ async function sendProactiveCheckin() {
 
     try {
       const resp = await anthropic.messages.create({
-        model: 'claude-sonnet-4-6',
+        model: 'claude-sonnet-4-5',
         max_tokens: 180,
         messages: [{ role: 'user', content: checkinPrompt }],
       });
